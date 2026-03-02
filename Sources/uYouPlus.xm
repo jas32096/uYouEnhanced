@@ -1,19 +1,6 @@
 #import "uYouPlus.h"
 #import "uYouPlusPatches.h"
 
-@interface YTSingleVideoController : NSObject
-@property (nonatomic, weak, readwrite) id delegate;
-@end
-
-@interface YTLocalPlaybackController : NSObject
-- (id<YTResponder>)parentResponder;
-@end
-
-@interface YTPlayerTapToRetryResponderEvent : NSObject
-+ (instancetype)eventWithFirstResponder:(id<YTResponder>)firstResponder;
-- (void)send;
-@end
-
 // Tweak's bundle for Localizations support - @PoomSmart - https://github.com/PoomSmart/YouPiP/commit/aea2473f64c75d73cab713e1e2d5d0a77675024f
 NSBundle *uYouPlusBundle() {
     static NSBundle *bundle = nil;
@@ -695,7 +682,7 @@ static void invalidateAutoRetryPlaybackTimer() {
                 return;
             }
 
-            id<YTResponder> parentResponder = [playbackController parentResponder];
+            id parentResponder = [playbackController parentResponder];
             if (!parentResponder) {
                 return;
             }
