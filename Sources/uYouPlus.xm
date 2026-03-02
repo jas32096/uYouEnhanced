@@ -688,13 +688,23 @@ static void invalidateAutoRetryPlaybackTimer() {
             }
 
             Class retryEventClass = %c(YTPlayerTapToRetryResponderEvent);
-            if (!retryEventClass || ![retryEventClass respondsToSelector:@selector(eventWithFirstResponder:)]) {
+            SEL eventSelector = NSSelectorFromString(@"eventWithFirstResponder:");
+            if (!retryEventClass || ![retryEventClass respondsToSelector:eventSelector]) {
                 return;
             }
 
-            id retryEvent = [retryEventClass eventWithFirstResponder:parentResponder];
-            if ([retryEvent respondsToSelector:@selector(send)]) {
-                [retryEvent send];
+            id (*eventInvoker)(id, SEL, id) = (id (*)(id, SEL, id))[retryEventClass methodForSelector:eventSelector];
+            if (!eventInvoker) {
+                return;
+            }
+
+            id retryEvent = eventInvoker(retryEventClass, eventSelector, parentResponder);
+            SEL sendSelector = NSSelectorFromString(@"send");
+            if ([retryEvent respondsToSelector:sendSelector]) {
+                void (*sendInvoker)(id, SEL) = (void (*)(id, SEL))[retryEvent methodForSelector:sendSelector];
+                if (sendInvoker) {
+                    sendInvoker(retryEvent, sendSelector);
+                }
             }
         }];
     } else {
