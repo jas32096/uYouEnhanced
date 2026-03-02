@@ -1,6 +1,19 @@
 #import "uYouPlus.h"
 #import "uYouPlusPatches.h"
 
+@interface YTSingleVideoController : NSObject
+@property (nonatomic, weak, readwrite) id delegate;
+@end
+
+@interface YTLocalPlaybackController : NSObject
+- (id<YTResponder>)parentResponder;
+@end
+
+@interface YTPlayerTapToRetryResponderEvent : NSObject
++ (instancetype)eventWithFirstResponder:(id<YTResponder>)firstResponder;
+- (void)send;
+@end
+
 // Tweak's bundle for Localizations support - @PoomSmart - https://github.com/PoomSmart/YouPiP/commit/aea2473f64c75d73cab713e1e2d5d0a77675024f
 NSBundle *uYouPlusBundle() {
     static NSBundle *bundle = nil;
@@ -401,6 +414,7 @@ YTMainAppControlsOverlayView *controlsOverlayView;
 - (BOOL)disableAfmaIdfaCollection { return NO; }
 %end
 %hook YTIPlayerResponse
+- (BOOL)isMonetized { return NO; }
 %new(@@:)
 - (NSMutableArray *)playerAdsArray {
     return [NSMutableArray array];
@@ -463,6 +477,7 @@ YTMainAppControlsOverlayView *controlsOverlayView;
 - (BOOL)disableAfmaIdfaCollection { return NO; }
 %end
 %hook YTIPlayerResponse
+- (BOOL)isMonetized { return NO; }
 %new(@@:)
 - (NSMutableArray *)playerAdsArray {
     return [NSMutableArray array];
@@ -549,6 +564,7 @@ static BOOL isProductList(YTICommand *command) {
     %orig;
 }
 %end
+
 NSString *getAdString(NSString *description) {
     for (NSString *str in @[
         @"brand_promo",
@@ -634,6 +650,71 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
 - (void)addSectionsFromArray:(NSArray <YTIItemSectionRenderer *> *)array {
     %orig(filteredArray(array));
 }
+%end
+%end
+
+static NSTimer *autoRetryPlaybackTimer = nil;
+
+static void invalidateAutoRetryPlaybackTimer() {
+    if (autoRetryPlaybackTimer) {
+        [autoRetryPlaybackTimer invalidate];
+        autoRetryPlaybackTimer = nil;
+    }
+}
+
+%group gAutoRetryPlayback
+%hook MLHAMQueuePlayer
+
+- (void)setState:(NSInteger)state {
+    %orig;
+
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"ReloadVideos"]) {
+        invalidateAutoRetryPlaybackTimer();
+        return;
+    }
+
+    if (state == 5 || state == 6 || state == 8) {
+        invalidateAutoRetryPlaybackTimer();
+        __weak typeof(self) weakSelf = self;
+        autoRetryPlaybackTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
+                                                                  repeats:NO
+                                                                    block:^(NSTimer *timer) {
+            autoRetryPlaybackTimer = nil;
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                return;
+            }
+
+            id queueDelegate = strongSelf.delegate;
+            if (!queueDelegate || ![queueDelegate respondsToSelector:@selector(delegate)]) {
+                return;
+            }
+
+            id playbackController = [queueDelegate delegate];
+            if (!playbackController || ![playbackController respondsToSelector:@selector(parentResponder)]) {
+                return;
+            }
+
+            id<YTResponder> parentResponder = [playbackController parentResponder];
+            if (!parentResponder) {
+                return;
+            }
+
+            Class retryEventClass = %c(YTPlayerTapToRetryResponderEvent);
+            if (!retryEventClass || ![retryEventClass respondsToSelector:@selector(eventWithFirstResponder:)]) {
+                return;
+            }
+
+            id retryEvent = [retryEventClass eventWithFirstResponder:parentResponder];
+            if ([retryEvent respondsToSelector:@selector(send)]) {
+                [retryEvent send];
+            }
+        }];
+    } else {
+        invalidateAutoRetryPlaybackTimer();
+    }
+}
+
 %end
 %end
 
@@ -1920,6 +2001,10 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
     // Load uYou first so its functions are available for hooks.
     // dlopen([[NSString stringWithFormat:@"%@/Frameworks/uYou.dylib", [[NSBundle mainBundle] bundlePath]] UTF8String], RTLD_LAZY);
 
+    [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+        kAutoRetryPlayback: @YES
+    }];
+
     %init;
 /*
     if (IS_ENABLED(kSettingsStyle_enabled)) {
@@ -2055,6 +2140,9 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
     if (IS_ENABLED(kFixCasting)) {
         %init(gFixCasting);
     }
+    if (IS_ENABLED(kAutoRetryPlayback)) {
+        %init(gAutoRetryPlayback);
+    }
 
     // YTNoModernUI - @arichornlover
     BOOL ytNoModernUIEnabled = IS_ENABLED(kYTNoModernUI);
@@ -2121,6 +2209,10 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
     // Set video casting fix default to enabled
     if (![allKeys containsObject:@"fixCasting_enabled"]) { 
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kFixCasting]; 
+    }
+    // Automatically retry stuck playback by default
+    if (![allKeys containsObject:kAutoRetryPlayback]) {
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAutoRetryPlayback];
     }
     // Set new grouped settings UI to default enabled
     if (![allKeys containsObject:@"newSettingsUI_enabled"]) { 

@@ -49,31 +49,31 @@ static VersionMapping versionMappings[] = {
     {40, @"20.25.4"},
     {41, @"20.24.5"},
     {42, @"20.24.4"},
-    {43, @"20.23.3 (Deprecated)"},
-    {44, @"20.22.1 (Deprecated)"},
-    {45, @"20.21.6 (Deprecated)"},
-    {46, @"20.20.7 (Deprecated)"},
-    {47, @"20.20.5 (Deprecated)"},
-    {48, @"20.19.3 (Deprecated)"},
-    {49, @"20.19.2 (Deprecated)"},
-    {50, @"20.18.5 (Deprecated)"},
-    {51, @"20.18.4 (Deprecated)"},
-    {52, @"20.16.7 (Deprecated)"},
-    {53, @"20.15.1 (Deprecated)"},
-    {54, @"20.14.2 (Deprecated)"},
-    {55, @"20.13.5 (Deprecated)"},
-    {56, @"20.12.4 (Deprecated)"},
-    {57, @"20.11.6 (Deprecated)"},
-    {58, @"20.10.4 (Deprecated)"},
-    {59, @"20.10.3 (Deprecated)"},
-    {60, @"20.09.3 (Deprecated)"},
-    {61, @"20.08.3 (Deprecated)"},
-    {62, @"20.07.6 (Deprecated)"},
-    {63, @"20.06.03 (Deprecated)"},
-    {64, @"20.05.4 (Deprecated)"},
-    {65, @"20.03.1 (Deprecated)"},
-    {66, @"20.03.02 (Deprecated)"},
-    {67, @"20.02.3 (Deprecated)"}
+    {43, @"20.23.3"},
+    {44, @"20.22.1"},
+    {45, @"20.21.6"},
+    {46, @"20.20.7"},
+    {47, @"20.20.5"},
+    {48, @"20.19.3"},
+    {49, @"20.19.2"},
+    {50, @"20.18.5"},
+    {51, @"20.18.4"},
+    {52, @"20.16.7"},
+    {53, @"20.15.1"},
+    {54, @"20.14.2"},
+    {55, @"20.13.5"},
+    {56, @"20.12.4"},
+    {57, @"20.11.6"},
+    {58, @"20.10.4"},
+    {59, @"20.10.3"},
+    {60, @"20.09.3"},
+    {61, @"20.08.3"},
+    {62, @"20.07.6"},
+    {63, @"20.06.03"},
+    {64, @"20.05.4"},
+    {65, @"20.03.1"},
+    {66, @"20.03.02"},
+    {67, @"20.02.3"}
 };
 
 static int appVersionSpoofer() {
@@ -93,13 +93,24 @@ static NSString* getAppVersionForSpoofedVersion(int spoofedVersion) {
     return nil;
 }
 
+static NSString *sanitizeSpoofedVersion(NSString *version) {
+    if (!version.length) {
+        return nil;
+    }
+    NSScanner *scanner = [NSScanner scannerWithString:version];
+    NSString *sanitizedVersion = nil;
+    NSCharacterSet *allowedCharacters = [NSCharacterSet characterSetWithCharactersInString:@"0123456789."];
+    [scanner scanCharactersFromSet:allowedCharacters intoString:&sanitizedVersion];
+    return sanitizedVersion.length ? sanitizedVersion : nil;
+}
+
 %hook YTVersionUtils
 + (NSString *)appVersion {
     if (!isVersionSpooferEnabled()) {
         return %orig;
     }
     int spoofedVersion = appVersionSpoofer();
-    NSString *appVersion = getAppVersionForSpoofedVersion(spoofedVersion);
+    NSString *appVersion = sanitizeSpoofedVersion(getAppVersionForSpoofedVersion(spoofedVersion));
     return appVersion ? appVersion : %orig;
 }
 %end

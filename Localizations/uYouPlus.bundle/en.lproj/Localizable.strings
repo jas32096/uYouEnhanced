@@ -301,6 +301,8 @@
 "HIDE_INDICATORS_DESC" = "Hides all Indicators that are currently in the App.";
 "FIX_CASTING" = "Fix Casting";
 "FIX_CASTING_DESC" = "Changes certain A/B flags to fix casting.";
+"AUTO_RETRY_STUCK_VIDEO" = "Auto-retry stuck video";
+"AUTO_RETRY_STUCK_VIDEO_DESC" = "Retries playback when a video gets stuck buffering for several seconds. App restart is required.";
 "NEW_SETTINGS_UI" = "Use New Settings UI";
 "NEW_SETTINGS_UI_DESC" = "Enables the new Settings UI with tweak categories.";
 
