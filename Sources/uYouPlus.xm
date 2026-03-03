@@ -682,6 +682,14 @@ static id invokeClassSelectorNoArgs(Class targetClass, SEL selector) {
     return invoker ? invoker(targetClass, selector) : nil;
 }
 
+static NSInteger invokeIntegerSelectorNoArgs(id target, SEL selector, NSInteger fallbackValue) {
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return fallbackValue;
+    }
+    NSInteger (*invoker)(id, SEL) = (NSInteger (*)(id, SEL))[target methodForSelector:selector];
+    return invoker ? invoker(target, selector) : fallbackValue;
+}
+
 static NSString *playbackDiagnosticConfigurationCode() {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     BOOL adblockWorkaroundEnabled = [defaults boolForKey:kAdBlockWorkaround];
@@ -1151,6 +1159,26 @@ static void invalidateAutoRetryPlaybackTimer() {
                 if (sendInvoker) {
                     sendInvoker(retryEvent, sendSelector);
                     markPlaybackDiagnostic(@"AUTO:EVENT_SENT");
+
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1200 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                        if (scheduledGeneration != autoRetryPlaybackGeneration) {
+                            return;
+                        }
+
+                        NSInteger observedState = invokeIntegerSelectorNoArgs(strongSelf, NSSelectorFromString(@"state"), NSIntegerMin);
+                        if (observedState != NSIntegerMin) {
+                            markPlaybackDiagnostic([NSString stringWithFormat:@"AUTO:CHK_S%ld", (long)observedState]);
+                        }
+
+                        if (observedState == 8 || observedState == 0) {
+                            NSString *actionCode = nil;
+                            BOOL performedFallbackAction = performAutoRetryFallbackAction(strongSelf, &actionCode);
+                            if (actionCode.length) {
+                                markPlaybackDiagnostic(actionCode);
+                            }
+                            markPlaybackDiagnostic(performedFallbackAction ? @"AUTO:POST_FALLBACK_OK" : @"AUTO:POST_FALLBACK_NONE");
+                        }
+                    });
                 } else {
                     markPlaybackDiagnostic(@"AUTO:ABORT_NO_SENDINVOKER");
                 }
@@ -1161,6 +1189,54 @@ static void invalidateAutoRetryPlaybackTimer() {
     } else {
         invalidateAutoRetryPlaybackTimer();
     }
+}
+
+%end
+
+%hook YTIPlayerResponse
+
+- (BOOL)hasPlayabilityStatus {
+    BOOL hasPlayabilityStatus = %orig;
+    if (!hasPlayabilityStatus) {
+        markPlaybackDiagnostic(@"PLY:NO_STATUS");
+    }
+    return hasPlayabilityStatus;
+}
+
+- (id)playabilityStatus {
+    id playabilityStatus = %orig;
+    if (!playabilityStatus) {
+        markPlaybackDiagnostic(@"PLY:STATUS_NIL");
+    }
+    return playabilityStatus;
+}
+
+%end
+
+%hook YTIPlayabilityStatus
+
+- (BOOL)isPlayable {
+    BOOL playable = %orig;
+    markPlaybackDiagnostic(playable ? @"PLY:PLAYABLE" : @"PLY:UNPLAYABLE");
+    return playable;
+}
+
+- (int)status {
+    int status = %orig;
+    markPlaybackDiagnostic([NSString stringWithFormat:@"PLY:ST%d", status]);
+    return status;
+}
+
+- (NSString *)reason {
+    NSString *reason = %orig;
+    if (reason.length) {
+        NSString *singleLineReason = [[reason componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] componentsJoinedByString:@" "];
+        if (singleLineReason.length > 24) {
+            singleLineReason = [singleLineReason substringToIndex:24];
+        }
+        markPlaybackDiagnostic([NSString stringWithFormat:@"PLY:R:%@", singleLineReason]);
+    }
+    return reason;
 }
 
 %end
