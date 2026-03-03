@@ -15,6 +15,7 @@ NSBundle *uYouPlusBundle() {
     return bundle;
 }
 NSBundle *tweakBundle = uYouPlusBundle();
+static NSInteger const kPlaybackIsolationStage = 0;
 //
 
 // Notifications Tab appearance
@@ -1897,6 +1898,10 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
 
 # pragma mark - ctor
 %ctor {
+    if (kPlaybackIsolationStage <= 1) {
+        return;
+    }
+
     // Load uYou first so its functions are available for hooks.
     // dlopen([[NSString stringWithFormat:@"%@/Frameworks/uYou.dylib", [[NSBundle mainBundle] bundlePath]] UTF8String], RTLD_LAZY);
 
