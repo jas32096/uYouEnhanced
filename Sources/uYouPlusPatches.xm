@@ -159,20 +159,6 @@ static BOOL isInnerTubeRequest(NSURL *url) {
             [absoluteString containsString:@"youtubei.googleapis.com"]);
 }
 
-static BOOL isInnerTubePlaybackLifecycleRequest(NSURL *url) {
-    if (![url isKindOfClass:[NSURL class]]) {
-        return NO;
-    }
-    NSString *absoluteString = url.absoluteString.lowercaseString;
-    if (![absoluteString isKindOfClass:[NSString class]]) {
-        return NO;
-    }
-    return ([absoluteString containsString:@"youtubei/v1/player"] ||
-            [absoluteString containsString:@"youtubei/v1/next"] ||
-            [absoluteString containsString:@"youtubei/v1/get_watch"] ||
-            [absoluteString containsString:@"youtubei/v1/reel/reel_watch_sequence"]);
-}
-
 static BOOL isGoogleVideoPlaybackRequest(NSURL *url) {
     if (![url isKindOfClass:[NSURL class]]) {
         return NO;
@@ -202,7 +188,7 @@ static BOOL headerLooksLoggedIn(NSDictionary *headers) {
 }
 
 static BOOL shouldStripSignedInHeadersForURL(NSURL *url) {
-    return isInnerTubePlaybackLifecycleRequest(url) || isGoogleVideoPlaybackRequest(url);
+    return isGoogleVideoPlaybackRequest(url);
 }
 
 static BOOL isBlockedSignedInHeaderField(NSString *field) {
@@ -215,15 +201,6 @@ static BOOL isBlockedSignedInHeaderField(NSString *field) {
            [lowerField isEqualToString:@"x-goog-authuser"] ||
            [lowerField isEqualToString:@"x-goog-pageid"] ||
            [lowerField isEqualToString:@"x-goog-device-auth"];
-}
-
-static BOOL isLoggedInStateHeaderField(NSString *field) {
-    if (![field isKindOfClass:[NSString class]]) {
-        return NO;
-    }
-    NSString *lowerField = field.lowercaseString;
-    return [lowerField isEqualToString:@"x-goog-logged-in"] ||
-           [lowerField isEqualToString:@"x-youtube-bootstrap-logged-in"];
 }
 
 static NSString *extractVisitorDataFromURL(NSURL *url) {
@@ -457,11 +434,6 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
         return;
     }
 
-    if (isInnerTubePlaybackLifecycleRequest(requestURL) && isLoggedInStateHeaderField(field)) {
-        %orig(@"0", field);
-        return;
-    }
-
     if ([field isKindOfClass:[NSString class]] && [field caseInsensitiveCompare:@"X-Goog-Visitor-Id"] == NSOrderedSame) {
         cacheVisitorData(value);
     }
@@ -486,11 +458,6 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
             if (matchedHeader) {
                 [normalizedHeaders removeObjectForKey:matchedHeader];
             }
-        }
-
-        if (isInnerTubePlaybackLifecycleRequest(requestURL)) {
-            normalizedHeaders[@"X-Goog-Logged-In"] = @"0";
-            normalizedHeaders[@"X-Youtube-Bootstrap-Logged-In"] = @"0";
         }
     }
 
