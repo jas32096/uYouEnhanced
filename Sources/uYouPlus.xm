@@ -15,8 +15,6 @@ NSBundle *uYouPlusBundle() {
     return bundle;
 }
 NSBundle *tweakBundle = uYouPlusBundle();
-
-static void markPlaybackDiagnostic(NSString *eventCode);
 //
 
 // Notifications Tab appearance
@@ -399,9 +397,6 @@ YTMainAppControlsOverlayView *controlsOverlayView;
 
 // uYou AdBlock Workaround LITE (This Version will only remove ads from only Videos/Shorts!) - @PoomSmart
 %group uYouAdBlockingWorkaroundLite
-%hook YTHotConfig
-- (BOOL)disableAfmaIdfaCollection { return NO; }
-%end
 %hook YTIPlayerResponse
 - (BOOL)isMonetized { return NO; }
 %new(@@:)
@@ -419,36 +414,17 @@ YTMainAppControlsOverlayView *controlsOverlayView;
 - (BOOL)enableSkippableAd { return YES; }
 %end
 
-%hook YTHotConfig
-- (BOOL)clientInfraClientConfigIosEnableFillingEncodedHacksInnertubeContext { return NO; }
-%end
-
-%hook YTAdShieldUtils
-+ (id)spamSignalsDictionary { return @{}; }
-+ (id)spamSignalsDictionaryWithoutIDFA { return @{}; }
-%end
-
 %hook YTDataUtils
-+ (id)spamSignalsDictionary { return @{ @"ms": @"" }; }
-+ (id)spamSignalsDictionaryWithoutIDFA { return @{}; }
++ (id)spamSignalsDictionary { return nil; }
++ (id)spamSignalsDictionaryWithoutIDFA { return nil; }
 %end
 
 %hook YTAdsInnerTubeContextDecorator
-- (void)decorateContext:(id)context {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        markPlaybackDiagnostic(@"ADCTX:LITE");
-    });
-}
+- (void)decorateContext:(id)context {}
 %end
 
 %hook YTAccountScopedAdsInnerTubeContextDecorator
-- (void)decorateContext:(id)context {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        markPlaybackDiagnostic(@"ADCTX_SC:LITE");
-    });
-}
+- (void)decorateContext:(id)context {}
 %end
 
 %hook YTLocalPlaybackController
@@ -471,10 +447,6 @@ YTMainAppControlsOverlayView *controlsOverlayView;
 
 // uYou AdBlock Workaround (Note: disables uYou's "Remove YouTube Ads" YouTube-X Option) - @PoomSmart, @arichornlover & @Dodieboy
 %group uYouAdBlockingWorkaround
-// Workaround: uYou 3.0.3 Adblock fix
-%hook YTHotConfig
-- (BOOL)disableAfmaIdfaCollection { return NO; }
-%end
 %hook YTIPlayerResponse
 - (BOOL)isMonetized { return NO; }
 %new(@@:)
@@ -490,32 +462,15 @@ YTMainAppControlsOverlayView *controlsOverlayView;
 %new(B@:)
 - (BOOL)enableSkippableAd { return YES; }
 %end
-%hook YTHotConfig
-- (BOOL)clientInfraClientConfigIosEnableFillingEncodedHacksInnertubeContext { return NO; }
-%end
-%hook YTAdShieldUtils
-+ (id)spamSignalsDictionary { return @{}; }
-+ (id)spamSignalsDictionaryWithoutIDFA { return @{}; }
-%end
 %hook YTDataUtils
-+ (id)spamSignalsDictionary { return @{ @"ms": @"" }; }
-+ (id)spamSignalsDictionaryWithoutIDFA { return @{}; }
++ (id)spamSignalsDictionary { return nil; }
++ (id)spamSignalsDictionaryWithoutIDFA { return nil; }
 %end
 %hook YTAdsInnerTubeContextDecorator
-- (void)decorateContext:(id)context {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        markPlaybackDiagnostic(@"ADCTX:FULL");
-    });
-}
+- (void)decorateContext:(id)context {}
 %end
 %hook YTAccountScopedAdsInnerTubeContextDecorator
-- (void)decorateContext:(id)context {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        markPlaybackDiagnostic(@"ADCTX_SC:FULL");
-    });
-}
+- (void)decorateContext:(id)context {}
 %end
 %hook YTLocalPlaybackController
 - (id)createAdsPlaybackCoordinator { return nil; }
@@ -659,586 +614,6 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
 - (void)addSectionsFromArray:(NSArray <YTIItemSectionRenderer *> *)array {
     %orig(filteredArray(array));
 }
-%end
-%end
-
-static NSUInteger autoRetryPlaybackGeneration = 0;
-static NSMutableArray<NSString *> *playbackDiagnosticTrail = nil;
-static BOOL playbackDiagnosticDidLogConfig = NO;
-
-static id invokeObjectSelectorNoArgs(id target, SEL selector) {
-    if (!target || !selector || ![target respondsToSelector:selector]) {
-        return nil;
-    }
-    id (*invoker)(id, SEL) = (id (*)(id, SEL))[target methodForSelector:selector];
-    return invoker ? invoker(target, selector) : nil;
-}
-
-static id invokeClassSelectorNoArgs(Class targetClass, SEL selector) {
-    if (!targetClass || !selector || ![targetClass respondsToSelector:selector]) {
-        return nil;
-    }
-    id (*invoker)(id, SEL) = (id (*)(id, SEL))[targetClass methodForSelector:selector];
-    return invoker ? invoker(targetClass, selector) : nil;
-}
-
-static NSInteger invokeIntegerSelectorNoArgs(id target, SEL selector, NSInteger fallbackValue) {
-    if (!target || !selector || ![target respondsToSelector:selector]) {
-        return fallbackValue;
-    }
-    NSInteger (*invoker)(id, SEL) = (NSInteger (*)(id, SEL))[target methodForSelector:selector];
-    return invoker ? invoker(target, selector) : fallbackValue;
-}
-
-static NSString *playbackDiagnosticConfigurationCode() {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    BOOL adblockWorkaroundEnabled = [defaults boolForKey:kAdBlockWorkaround];
-    BOOL adblockWorkaroundLiteEnabled = [defaults boolForKey:kAdBlockWorkaroundLite];
-    BOOL versionSpooferEnabled = [defaults boolForKey:kEnableVersionSpoofer];
-    NSInteger spoofedVersionIndex = [defaults integerForKey:@"versionSpoofer"];
-    BOOL reloadVideosEnabled = [defaults boolForKey:@"ReloadVideos"];
-    BOOL swVP9orAV1Enabled = [defaults boolForKey:@"EnableSWVP9orSWAV1"];
-    return [NSString stringWithFormat:@"CFG:A%dL%dV%dI%ldR%dU%d",
-            adblockWorkaroundEnabled ? 1 : 0,
-            adblockWorkaroundLiteEnabled ? 1 : 0,
-            versionSpooferEnabled ? 1 : 0,
-            (long)spoofedVersionIndex,
-            reloadVideosEnabled ? 1 : 0,
-            swVP9orAV1Enabled ? 1 : 0];
-}
-
-static BOOL invokeVoidSelectorNoArgs(id target, SEL selector) {
-    if (!target || !selector || ![target respondsToSelector:selector]) {
-        return NO;
-    }
-    void (*invoker)(id, SEL) = (void (*)(id, SEL))[target methodForSelector:selector];
-    if (!invoker) {
-        return NO;
-    }
-    invoker(target, selector);
-    return YES;
-}
-
-static BOOL invokeVoidSelectorBoolArg(id target, SEL selector, BOOL value) {
-    if (!target || !selector || ![target respondsToSelector:selector]) {
-        return NO;
-    }
-    void (*invoker)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))[target methodForSelector:selector];
-    if (!invoker) {
-        return NO;
-    }
-    invoker(target, selector, value);
-    return YES;
-}
-
-static BOOL markVisitedObject(NSMutableSet<NSValue *> *visited, id object) {
-    if (!object) {
-        return NO;
-    }
-    NSValue *key = [NSValue valueWithNonretainedObject:object];
-    if ([visited containsObject:key]) {
-        return NO;
-    }
-    [visited addObject:key];
-    return YES;
-}
-
-static UIViewController *topViewControllerForAutoRetry() {
-    UIViewController *topViewController = invokeClassSelectorNoArgs(%c(YTUIUtils), NSSelectorFromString(@"topViewControllerForPresenting"));
-    if (!topViewController) {
-        UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
-        if (!keyWindow && UIApplication.sharedApplication.windows.count > 0) {
-            keyWindow = UIApplication.sharedApplication.windows.firstObject;
-        }
-        topViewController = keyWindow.rootViewController;
-    }
-    UIViewController *presented = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"presentedViewController"));
-    while (presented) {
-        topViewController = presented;
-        presented = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"presentedViewController"));
-    }
-    return topViewController;
-}
-
-static id resolveResponderFromPlayerViewController(id playerViewController, NSString **sourceCode) {
-    if (!playerViewController) {
-        return nil;
-    }
-
-    SEL parentResponderSelector = NSSelectorFromString(@"parentResponder");
-    SEL delegateSelector = NSSelectorFromString(@"delegate");
-
-    id overlayController = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"activeVideoPlayerOverlay"));
-    id overlayResponder = invokeObjectSelectorNoArgs(overlayController, parentResponderSelector);
-    if (overlayResponder) {
-        if (sourceCode) {
-            *sourceCode = @"RSRC:OVERLAY";
-        }
-        return overlayResponder;
-    }
-
-    id playerResponder = invokeObjectSelectorNoArgs(playerViewController, parentResponderSelector);
-    if (playerResponder) {
-        if (sourceCode) {
-            *sourceCode = @"RSRC:PLAYERVC";
-        }
-        return playerResponder;
-    }
-
-    id uiDelegate = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"UIDelegate"));
-    id uiDelegateResponder = invokeObjectSelectorNoArgs(uiDelegate, parentResponderSelector);
-    if (uiDelegateResponder) {
-        if (sourceCode) {
-            *sourceCode = @"RSRC:UIDEL";
-        }
-        return uiDelegateResponder;
-    }
-
-    id activeVideo = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"activeVideo"));
-    id localPlaybackController = invokeObjectSelectorNoArgs(activeVideo, delegateSelector);
-    id localPlaybackResponder = invokeObjectSelectorNoArgs(localPlaybackController, parentResponderSelector);
-    if (localPlaybackResponder) {
-        if (sourceCode) {
-            *sourceCode = @"RSRC:ACTIVEVIDEO";
-        }
-        return localPlaybackResponder;
-    }
-
-    return nil;
-}
-
-static id resolveResponderInControllerGraph(id controller, NSMutableSet<NSValue *> *visited, NSString **sourceCode) {
-    if (!controller || !markVisitedObject(visited, controller)) {
-        return nil;
-    }
-
-    SEL parentResponderSelector = NSSelectorFromString(@"parentResponder");
-    id directResponder = invokeObjectSelectorNoArgs(controller, parentResponderSelector);
-    if (directResponder) {
-        if (sourceCode) {
-            *sourceCode = @"RSRC:CTRL";
-        }
-        return directResponder;
-    }
-
-    id fromSelfAsPlayer = resolveResponderFromPlayerViewController(controller, sourceCode);
-    if (fromSelfAsPlayer) {
-        return fromSelfAsPlayer;
-    }
-
-    id playerViewController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"playerViewController"));
-    id fromPlayerViewController = resolveResponderFromPlayerViewController(playerViewController, sourceCode);
-    if (fromPlayerViewController) {
-        return fromPlayerViewController;
-    }
-
-    NSArray *navigationStack = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"viewControllers"));
-    if ([navigationStack isKindOfClass:[NSArray class]]) {
-        for (id childController in navigationStack) {
-            id responder = resolveResponderInControllerGraph(childController, visited, sourceCode);
-            if (responder) {
-                return responder;
-            }
-        }
-    }
-
-    id visibleController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"visibleViewController"));
-    id responderFromVisible = resolveResponderInControllerGraph(visibleController, visited, sourceCode);
-    if (responderFromVisible) {
-        return responderFromVisible;
-    }
-
-    id selectedController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"selectedViewController"));
-    id responderFromSelected = resolveResponderInControllerGraph(selectedController, visited, sourceCode);
-    if (responderFromSelected) {
-        return responderFromSelected;
-    }
-
-    id presentedController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"presentedViewController"));
-    id responderFromPresented = resolveResponderInControllerGraph(presentedController, visited, sourceCode);
-    if (responderFromPresented) {
-        return responderFromPresented;
-    }
-
-    NSArray *childControllers = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"childViewControllers"));
-    if ([childControllers isKindOfClass:[NSArray class]]) {
-        for (id childController in childControllers) {
-            id responder = resolveResponderInControllerGraph(childController, visited, sourceCode);
-            if (responder) {
-                return responder;
-            }
-        }
-    }
-
-    return nil;
-}
-
-static id resolveAutoRetryParentResponder(id queuePlayer, NSString **sourceCode) {
-    SEL delegateSelector = NSSelectorFromString(@"delegate");
-    SEL parentResponderSelector = NSSelectorFromString(@"parentResponder");
-
-    id queueDelegate = invokeObjectSelectorNoArgs(queuePlayer, delegateSelector);
-    if (queueDelegate) {
-        id playbackController = invokeObjectSelectorNoArgs(queueDelegate, delegateSelector);
-        id chainResponder = invokeObjectSelectorNoArgs(playbackController, parentResponderSelector);
-        if (chainResponder) {
-            if (sourceCode) {
-                *sourceCode = @"RSRC:QD_CHAIN";
-            }
-            return chainResponder;
-        }
-
-        id directQueueDelegateResponder = invokeObjectSelectorNoArgs(queueDelegate, parentResponderSelector);
-        if (directQueueDelegateResponder) {
-            if (sourceCode) {
-                *sourceCode = @"RSRC:QD_DIRECT";
-            }
-            return directQueueDelegateResponder;
-        }
-    }
-
-    UIViewController *topViewController = topViewControllerForAutoRetry();
-    NSMutableSet<NSValue *> *visited = [NSMutableSet set];
-    id resolvedResponder = resolveResponderInControllerGraph(topViewController, visited, sourceCode);
-    if (resolvedResponder) {
-        return resolvedResponder;
-    }
-
-    if (sourceCode) {
-        *sourceCode = @"MISS:NONE";
-    }
-    return nil;
-}
-
-static BOOL performFallbackActionFromPlayerViewController(id playerViewController, NSString **actionCode) {
-    if (!playerViewController) {
-        return NO;
-    }
-
-    if (invokeVoidSelectorNoArgs(playerViewController, NSSelectorFromString(@"replay"))) {
-        if (actionCode) {
-            *actionCode = @"ACT:PVC_REPLAY";
-        }
-        return YES;
-    }
-
-    id activeVideo = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"activeVideo"));
-    id localPlaybackController = invokeObjectSelectorNoArgs(activeVideo, NSSelectorFromString(@"delegate"));
-    if (invokeVoidSelectorNoArgs(localPlaybackController, NSSelectorFromString(@"replay"))) {
-        if (actionCode) {
-            *actionCode = @"ACT:LPC_REPLAY";
-        }
-        return YES;
-    }
-
-    id uiDelegate = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"UIDelegate"));
-    if (invokeVoidSelectorBoolArg(uiDelegate, NSSelectorFromString(@"reloadStartPlayback:"), YES)) {
-        if (actionCode) {
-            *actionCode = @"ACT:UIDEL_RELOAD";
-        }
-        return YES;
-    }
-
-    return NO;
-}
-
-static BOOL performFallbackActionInControllerGraph(id controller, NSMutableSet<NSValue *> *visited, NSString **actionCode) {
-    if (!controller || !markVisitedObject(visited, controller)) {
-        return NO;
-    }
-
-    if (performFallbackActionFromPlayerViewController(controller, actionCode)) {
-        return YES;
-    }
-
-    id playerViewController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"playerViewController"));
-    if (performFallbackActionFromPlayerViewController(playerViewController, actionCode)) {
-        return YES;
-    }
-
-    NSArray *navigationStack = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"viewControllers"));
-    if ([navigationStack isKindOfClass:[NSArray class]]) {
-        for (id childController in navigationStack) {
-            if (performFallbackActionInControllerGraph(childController, visited, actionCode)) {
-                return YES;
-            }
-        }
-    }
-
-    id visibleController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"visibleViewController"));
-    if (performFallbackActionInControllerGraph(visibleController, visited, actionCode)) {
-        return YES;
-    }
-
-    id selectedController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"selectedViewController"));
-    if (performFallbackActionInControllerGraph(selectedController, visited, actionCode)) {
-        return YES;
-    }
-
-    id presentedController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"presentedViewController"));
-    if (performFallbackActionInControllerGraph(presentedController, visited, actionCode)) {
-        return YES;
-    }
-
-    NSArray *childControllers = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"childViewControllers"));
-    if ([childControllers isKindOfClass:[NSArray class]]) {
-        for (id childController in childControllers) {
-            if (performFallbackActionInControllerGraph(childController, visited, actionCode)) {
-                return YES;
-            }
-        }
-    }
-
-    return NO;
-}
-
-static BOOL performAutoRetryFallbackAction(id queuePlayer, NSString **actionCode) {
-    id queueDelegate = invokeObjectSelectorNoArgs(queuePlayer, NSSelectorFromString(@"delegate"));
-    if (invokeVoidSelectorNoArgs(queueDelegate, NSSelectorFromString(@"replay"))) {
-        if (actionCode) {
-            *actionCode = @"ACT:QD_REPLAY";
-        }
-        return YES;
-    }
-
-    id playbackController = invokeObjectSelectorNoArgs(queueDelegate, NSSelectorFromString(@"delegate"));
-    if (invokeVoidSelectorNoArgs(playbackController, NSSelectorFromString(@"replay"))) {
-        if (actionCode) {
-            *actionCode = @"ACT:PLAYCTRL_REPLAY";
-        }
-        return YES;
-    }
-    if (invokeVoidSelectorBoolArg(playbackController, NSSelectorFromString(@"reloadStartPlayback:"), YES)) {
-        if (actionCode) {
-            *actionCode = @"ACT:PLAYCTRL_RELOAD";
-        }
-        return YES;
-    }
-
-    UIViewController *topViewController = topViewControllerForAutoRetry();
-    NSMutableSet<NSValue *> *visited = [NSMutableSet set];
-    BOOL performed = performFallbackActionInControllerGraph(topViewController, visited, actionCode);
-    if (!performed && actionCode) {
-        *actionCode = @"ACT:NONE";
-    }
-    return performed;
-}
-
-static void ensurePlaybackDiagnosticTrail() {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        playbackDiagnosticTrail = [[NSMutableArray alloc] init];
-    });
-}
-
-static void showPlaybackDiagnosticBanner(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
-        if (!keyWindow && UIApplication.sharedApplication.windows.count > 0) {
-            keyWindow = UIApplication.sharedApplication.windows.firstObject;
-        }
-        if (!keyWindow) {
-            return;
-        }
-
-        const NSInteger bannerTag = 909143;
-        UILabel *label = [keyWindow viewWithTag:bannerTag];
-        if (![label isKindOfClass:[UILabel class]]) {
-            label = [[UILabel alloc] initWithFrame:CGRectZero];
-            label.tag = bannerTag;
-            label.numberOfLines = 3;
-            label.textAlignment = NSTextAlignmentCenter;
-            label.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightSemibold];
-            label.textColor = UIColor.whiteColor;
-            label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
-            label.layer.cornerRadius = 10.0;
-            label.layer.masksToBounds = YES;
-            [keyWindow addSubview:label];
-        }
-
-        CGFloat width = MIN(CGRectGetWidth(keyWindow.bounds) - 24.0, 420.0);
-        label.frame = CGRectMake((CGRectGetWidth(keyWindow.bounds) - width) / 2.0, 64.0, width, 62.0);
-        label.text = text;
-
-        [NSObject cancelPreviousPerformRequestsWithTarget:label selector:@selector(removeFromSuperview) object:nil];
-        [label performSelector:@selector(removeFromSuperview) withObject:nil afterDelay:5.0];
-    });
-}
-
-static void markPlaybackDiagnostic(NSString *eventCode) {
-    ensurePlaybackDiagnosticTrail();
-    if (!eventCode.length) {
-        return;
-    }
-    @synchronized (playbackDiagnosticTrail) {
-        [playbackDiagnosticTrail addObject:eventCode];
-        if (playbackDiagnosticTrail.count > 8) {
-            [playbackDiagnosticTrail removeObjectAtIndex:0];
-        }
-        NSString *text = [NSString stringWithFormat:@"Diag %@", [playbackDiagnosticTrail componentsJoinedByString:@" > "]];
-        NSLog(@"[uYouEnhanced][PlaybackDiag] %@", text);
-        showPlaybackDiagnosticBanner(text);
-    }
-}
-
-static void invalidateAutoRetryPlaybackTimer() {
-    autoRetryPlaybackGeneration += 1;
-}
-
-%group gAutoRetryPlayback
-%hook MLHAMQueuePlayer
-
-- (void)setState:(NSInteger)state {
-    %orig;
-
-    if (!playbackDiagnosticDidLogConfig) {
-        playbackDiagnosticDidLogConfig = YES;
-        markPlaybackDiagnostic(playbackDiagnosticConfigurationCode());
-    }
-
-    markPlaybackDiagnostic([NSString stringWithFormat:@"S%ld", (long)state]);
-
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"ReloadVideos"]) {
-        markPlaybackDiagnostic(@"AUTO:DISABLED_ReloadVideos");
-        invalidateAutoRetryPlaybackTimer();
-        return;
-    }
-
-    if (state == 5 || state == 6 || state == 8) {
-        markPlaybackDiagnostic(@"AUTO:ARM");
-        invalidateAutoRetryPlaybackTimer();
-        __weak typeof(self) weakSelf = self;
-        NSUInteger scheduledGeneration = autoRetryPlaybackGeneration;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (scheduledGeneration != autoRetryPlaybackGeneration) {
-                return;
-            }
-            markPlaybackDiagnostic(@"AUTO:FIRE_MAIN");
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) {
-                markPlaybackDiagnostic(@"AUTO:ABORT_NO_PLAYER");
-                return;
-            }
-
-            NSString *responderSourceCode = nil;
-            id parentResponder = resolveAutoRetryParentResponder(strongSelf, &responderSourceCode);
-            if (responderSourceCode.length) {
-                markPlaybackDiagnostic(responderSourceCode);
-            }
-            if (!parentResponder) {
-                NSString *actionCode = nil;
-                BOOL performedFallbackAction = performAutoRetryFallbackAction(strongSelf, &actionCode);
-                if (actionCode.length) {
-                    markPlaybackDiagnostic(actionCode);
-                }
-                if (performedFallbackAction) {
-                    markPlaybackDiagnostic(@"AUTO:FALLBACK_OK");
-                } else {
-                    markPlaybackDiagnostic(@"AUTO:ABORT_NO_RESPONDER");
-                }
-                return;
-            }
-
-            Class retryEventClass = %c(YTPlayerTapToRetryResponderEvent);
-            SEL eventSelector = NSSelectorFromString(@"eventWithFirstResponder:");
-            if (!retryEventClass || ![retryEventClass respondsToSelector:eventSelector]) {
-                markPlaybackDiagnostic(@"AUTO:ABORT_NO_EVENTCLASS");
-                return;
-            }
-
-            id (*eventInvoker)(id, SEL, id) = (id (*)(id, SEL, id))[retryEventClass methodForSelector:eventSelector];
-            if (!eventInvoker) {
-                markPlaybackDiagnostic(@"AUTO:ABORT_NO_EVENTINVOKER");
-                return;
-            }
-
-            id retryEvent = eventInvoker(retryEventClass, eventSelector, parentResponder);
-            SEL sendSelector = NSSelectorFromString(@"send");
-            if ([retryEvent respondsToSelector:sendSelector]) {
-                void (*sendInvoker)(id, SEL) = (void (*)(id, SEL))[retryEvent methodForSelector:sendSelector];
-                if (sendInvoker) {
-                    sendInvoker(retryEvent, sendSelector);
-                    markPlaybackDiagnostic(@"AUTO:EVENT_SENT");
-
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1200 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-                        if (scheduledGeneration != autoRetryPlaybackGeneration) {
-                            return;
-                        }
-
-                        NSInteger observedState = invokeIntegerSelectorNoArgs(strongSelf, NSSelectorFromString(@"state"), NSIntegerMin);
-                        if (observedState != NSIntegerMin) {
-                            markPlaybackDiagnostic([NSString stringWithFormat:@"AUTO:CHK_S%ld", (long)observedState]);
-                        }
-
-                        if (observedState == 8 || observedState == 0) {
-                            NSString *actionCode = nil;
-                            BOOL performedFallbackAction = performAutoRetryFallbackAction(strongSelf, &actionCode);
-                            if (actionCode.length) {
-                                markPlaybackDiagnostic(actionCode);
-                            }
-                            markPlaybackDiagnostic(performedFallbackAction ? @"AUTO:POST_FALLBACK_OK" : @"AUTO:POST_FALLBACK_NONE");
-                        }
-                    });
-                } else {
-                    markPlaybackDiagnostic(@"AUTO:ABORT_NO_SENDINVOKER");
-                }
-            } else {
-                markPlaybackDiagnostic(@"AUTO:ABORT_NO_SENDSELECTOR");
-            }
-        });
-    } else {
-        invalidateAutoRetryPlaybackTimer();
-    }
-}
-
-%end
-
-%hook YTIPlayerResponse
-
-- (BOOL)hasPlayabilityStatus {
-    BOOL hasPlayabilityStatus = %orig;
-    if (!hasPlayabilityStatus) {
-        markPlaybackDiagnostic(@"PLY:NO_STATUS");
-    }
-    return hasPlayabilityStatus;
-}
-
-- (id)playabilityStatus {
-    id playabilityStatus = %orig;
-    if (!playabilityStatus) {
-        markPlaybackDiagnostic(@"PLY:STATUS_NIL");
-    }
-    return playabilityStatus;
-}
-
-%end
-
-%hook YTIPlayabilityStatus
-
-- (BOOL)isPlayable {
-    BOOL playable = %orig;
-    markPlaybackDiagnostic(playable ? @"PLY:PLAYABLE" : @"PLY:UNPLAYABLE");
-    return playable;
-}
-
-- (int)status {
-    int status = %orig;
-    markPlaybackDiagnostic([NSString stringWithFormat:@"PLY:ST%d", status]);
-    return status;
-}
-
-- (NSString *)reason {
-    NSString *reason = %orig;
-    if (reason.length) {
-        NSString *singleLineReason = [[reason componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] componentsJoinedByString:@" "];
-        if (singleLineReason.length > 24) {
-            singleLineReason = [singleLineReason substringToIndex:24];
-        }
-        markPlaybackDiagnostic([NSString stringWithFormat:@"PLY:R:%@", singleLineReason]);
-    }
-    return reason;
-}
-
 %end
 %end
 
@@ -2525,11 +1900,15 @@ static void invalidateAutoRetryPlaybackTimer() {
     // Load uYou first so its functions are available for hooks.
     // dlopen([[NSString stringWithFormat:@"%@/Frameworks/uYou.dylib", [[NSBundle mainBundle] bundlePath]] UTF8String], RTLD_LAZY);
 
-    [[NSUserDefaults standardUserDefaults] registerDefaults:@{
-        kAutoRetryPlayback: @YES
-    }];
-
     %init;
+
+    NSUserDefaults *userDefaults = [NSUserDefaults standardUserDefaults];
+    if (![userDefaults boolForKey:@"playbackRootCauseHotfixApplied"]) {
+        [userDefaults setBool:NO forKey:kAdBlockWorkaroundLite];
+        [userDefaults setBool:NO forKey:kAdBlockWorkaround];
+        [userDefaults setBool:NO forKey:kAutoRetryPlayback];
+        [userDefaults setBool:YES forKey:@"playbackRootCauseHotfixApplied"];
+    }
 /*
     if (IS_ENABLED(kSettingsStyle_enabled)) {
         %init(gSettingsStyle);
@@ -2664,22 +2043,15 @@ static void invalidateAutoRetryPlaybackTimer() {
     if (IS_ENABLED(kFixCasting)) {
         %init(gFixCasting);
     }
-    if (IS_ENABLED(kAutoRetryPlayback)) {
-        %init(gAutoRetryPlayback);
-    }
 
     // YTNoModernUI - @arichornlover
     BOOL ytNoModernUIEnabled = IS_ENABLED(kYTNoModernUI);
     if (ytNoModernUIEnabled) {
-        NSUserDefaults *userDefaults = [NSUserDefaults standardUserDefaults];
         [userDefaults setBool:NO forKey:kEnableVersionSpoofer];
     } else {
         BOOL enableVersionSpooferEnabled = IS_ENABLED(kEnableVersionSpoofer);
-
-        NSUserDefaults *userDefaults = [NSUserDefaults standardUserDefaults];
         [userDefaults setBool:enableVersionSpooferEnabled forKey:kEnableVersionSpoofer];
     }
-    NSUserDefaults *userDefaults = [NSUserDefaults standardUserDefaults];
     [userDefaults setBool:ytNoModernUIEnabled ? ytNoModernUIEnabled : [userDefaults boolForKey:kDisableModernButtons] forKey:kDisableModernButtons];
     [userDefaults setBool:ytNoModernUIEnabled ? ytNoModernUIEnabled : [userDefaults boolForKey:kDisableRoundedHints] forKey:kDisableRoundedHints];
     [userDefaults setBool:ytNoModernUIEnabled ? ytNoModernUIEnabled : [userDefaults boolForKey:kDisableModernFlags] forKey:kDisableModernFlags];
@@ -2706,15 +2078,14 @@ static void invalidateAutoRetryPlaybackTimer() {
     if (![allKeys containsObject:kReplaceYTDownloadWithuYou]) {
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kReplaceYTDownloadWithuYou];
     }
-    if (![allKeys containsObject:kAdBlockWorkaroundLite]) { 
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAdBlockWorkaroundLite];
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:kAdBlockWorkaround];
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"removeYouTubeAds"];
+    BOOL hasAdBlockWorkaroundLite = [allKeys containsObject:kAdBlockWorkaroundLite];
+    BOOL hasAdBlockWorkaround = [allKeys containsObject:kAdBlockWorkaround];
+    if (!hasAdBlockWorkaroundLite && !hasAdBlockWorkaround) {
+        [userDefaults setBool:NO forKey:kAdBlockWorkaroundLite];
+        [userDefaults setBool:NO forKey:kAdBlockWorkaround];
     }
-    if (![allKeys containsObject:kAdBlockWorkaround]) { 
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:kAdBlockWorkaroundLite];
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAdBlockWorkaround];
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"removeYouTubeAds"];
+    if ([userDefaults boolForKey:kAdBlockWorkaroundLite] && [userDefaults boolForKey:kAdBlockWorkaround]) {
+        [userDefaults setBool:NO forKey:kAdBlockWorkaround];
     }
     // Broken uYou 3.0.3 setting: No Suggested Videos at The Video End
     // Set default to allow autoplay, user can disable later
@@ -2736,7 +2107,7 @@ static void invalidateAutoRetryPlaybackTimer() {
     }
     // Automatically retry stuck playback by default
     if (![allKeys containsObject:kAutoRetryPlayback]) {
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAutoRetryPlayback];
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:kAutoRetryPlayback];
     }
     // Set new grouped settings UI to default enabled
     if (![allKeys containsObject:@"newSettingsUI_enabled"]) { 

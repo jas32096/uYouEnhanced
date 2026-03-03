@@ -52,6 +52,217 @@
 - (BOOL)disableAfmaIdfaCollection { return %orig; }
 %end
 
+static NSString *const kCachedVisitorDataKey = @"uYouEnhancedCachedVisitorData";
+static NSString *cachedVisitorData = nil;
+
+static dispatch_queue_t visitorDataQueue() {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.uyouenhanced.visitor-data", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static NSString *trimmedString(NSString *value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+    NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return trimmed.length ? trimmed : nil;
+}
+
+static NSString *headerValueForKey(NSDictionary *headers, NSString *targetKey) {
+    if (![headers isKindOfClass:[NSDictionary class]] || !targetKey.length) {
+        return nil;
+    }
+    __block NSString *value = nil;
+    [headers enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+        if (![key isKindOfClass:[NSString class]]) {
+            return;
+        }
+        if ([(NSString *)key caseInsensitiveCompare:targetKey] == NSOrderedSame) {
+            value = trimmedString(obj);
+            *stop = YES;
+        }
+    }];
+    return value;
+}
+
+static BOOL isInnerTubeRequest(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) {
+        return NO;
+    }
+    NSString *absoluteString = url.absoluteString.lowercaseString;
+    if (![absoluteString isKindOfClass:[NSString class]]) {
+        return NO;
+    }
+    return ([absoluteString containsString:@"youtubei/v1/"] ||
+            [absoluteString containsString:@"youtubei.googleapis.com"]);
+}
+
+static NSString *extractVisitorDataFromURL(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) {
+        return nil;
+    }
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    for (NSURLQueryItem *queryItem in components.queryItems) {
+        if (![queryItem.name isKindOfClass:[NSString class]]) {
+            continue;
+        }
+        NSString *key = queryItem.name.lowercaseString;
+        if ([key isEqualToString:@"visitordata"] || [key isEqualToString:@"visitor_data"]) {
+            return trimmedString(queryItem.value);
+        }
+    }
+    return nil;
+}
+
+static NSString *extractVisitorDataFromString(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+        return nil;
+    }
+    static NSArray<NSRegularExpression *> *regexes;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        regexes = @[
+            [NSRegularExpression regularExpressionWithPattern:@"\\\"visitorData\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"" options:0 error:nil],
+            [NSRegularExpression regularExpressionWithPattern:@"\\\"VISITOR_DATA\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"" options:0 error:nil],
+            [NSRegularExpression regularExpressionWithPattern:@"X-Goog-Visitor-Id\\\"?\\s*[:=]\\s*\\\"([^\\\"]+)\\\"" options:NSRegularExpressionCaseInsensitive error:nil]
+        ];
+    });
+
+    NSRange range = NSMakeRange(0, text.length);
+    for (NSRegularExpression *regex in regexes) {
+        NSTextCheckingResult *match = [regex firstMatchInString:text options:0 range:range];
+        if (match.numberOfRanges < 2) {
+            continue;
+        }
+        NSString *matchValue = [text substringWithRange:[match rangeAtIndex:1]];
+        NSString *trimmed = trimmedString(matchValue);
+        if (trimmed.length) {
+            return trimmed;
+        }
+    }
+    return nil;
+}
+
+static NSString *extractVisitorDataFromBody(NSData *data) {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > (1024 * 1024)) {
+        return nil;
+    }
+    NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return extractVisitorDataFromString(body);
+}
+
+static void cacheVisitorData(NSString *value) {
+    NSString *trimmed = trimmedString(value);
+    if (!trimmed.length) {
+        return;
+    }
+    dispatch_async(visitorDataQueue(), ^{
+        cachedVisitorData = [trimmed copy];
+        [[NSUserDefaults standardUserDefaults] setObject:cachedVisitorData forKey:kCachedVisitorDataKey];
+    });
+}
+
+static NSString *currentVisitorData() {
+    __block NSString *value = nil;
+    dispatch_sync(visitorDataQueue(), ^{
+        if (!cachedVisitorData.length) {
+            cachedVisitorData = trimmedString([[NSUserDefaults standardUserDefaults] stringForKey:kCachedVisitorDataKey]);
+        }
+        value = cachedVisitorData;
+    });
+    return value;
+}
+
+static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request) {
+    if (![request isKindOfClass:[NSURLRequest class]] || !isInnerTubeRequest(request.URL)) {
+        return request;
+    }
+
+    NSString *visitorDataFromHeaders = headerValueForKey(request.allHTTPHeaderFields, @"X-Goog-Visitor-Id");
+    if (visitorDataFromHeaders.length) {
+        cacheVisitorData(visitorDataFromHeaders);
+        return request;
+    }
+
+    NSString *visitorData = currentVisitorData();
+    if (!visitorData.length) {
+        visitorData = extractVisitorDataFromURL(request.URL);
+    }
+    if (!visitorData.length) {
+        visitorData = extractVisitorDataFromBody(request.HTTPBody);
+    }
+    if (!visitorData.length) {
+        return request;
+    }
+
+    NSMutableURLRequest *mutableRequest = [request mutableCopy];
+    [mutableRequest setValue:visitorData forHTTPHeaderField:@"X-Goog-Visitor-Id"];
+    return mutableRequest;
+}
+
+static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) {
+    if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSDictionary *headers = ((NSHTTPURLResponse *)response).allHeaderFields;
+        NSString *visitorDataFromHeaders = headerValueForKey(headers, @"X-Goog-Visitor-Id");
+        if (!visitorDataFromHeaders.length) {
+            visitorDataFromHeaders = headerValueForKey(headers, @"X-Youtube-Client-Visitor-Id");
+        }
+        if (visitorDataFromHeaders.length) {
+            cacheVisitorData(visitorDataFromHeaders);
+            return;
+        }
+    }
+
+    NSString *visitorDataFromBody = extractVisitorDataFromBody(data);
+    if (visitorDataFromBody.length) {
+        cacheVisitorData(visitorDataFromBody);
+    }
+}
+
+%hook NSMutableURLRequest
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    if ([field isKindOfClass:[NSString class]] && [field caseInsensitiveCompare:@"X-Goog-Visitor-Id"] == NSOrderedSame) {
+        cacheVisitorData(value);
+    }
+    %orig;
+}
+
+- (void)setAllHTTPHeaderFields:(NSDictionary<NSString *, NSString *> *)headerFields {
+    cacheVisitorData(headerValueForKey(headerFields, @"X-Goog-Visitor-Id"));
+    %orig;
+}
+%end
+
+%hook NSURLSession
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    return %orig(requestByInjectingVisitorDataIfNeeded(request));
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
+    return %orig(patchedRequest, ^(NSData *data, NSURLResponse *response, NSError *error) {
+        cacheVisitorDataFromResponse(response, data);
+        if (completionHandler) {
+            completionHandler(data, response, error);
+        }
+    });
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
+    return %orig(patchedRequest, bodyData, ^(NSData *data, NSURLResponse *response, NSError *error) {
+        cacheVisitorDataFromResponse(response, data);
+        if (completionHandler) {
+            completionHandler(data, response, error);
+        }
+    });
+}
+%end
+
 // Reposition "Create" Tab to the Center in the Pivot Bar - qnblackcat/uYouPlus#107
 /*
 static void repositionCreateTab(YTIGuideResponse *response) {
