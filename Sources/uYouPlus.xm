@@ -15,6 +15,8 @@ NSBundle *uYouPlusBundle() {
     return bundle;
 }
 NSBundle *tweakBundle = uYouPlusBundle();
+
+static void markPlaybackDiagnostic(NSString *eventCode);
 //
 
 // Notifications Tab appearance
@@ -432,11 +434,21 @@ YTMainAppControlsOverlayView *controlsOverlayView;
 %end
 
 %hook YTAdsInnerTubeContextDecorator
-- (void)decorateContext:(id)context {}
+- (void)decorateContext:(id)context {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        markPlaybackDiagnostic(@"ADCTX:LITE");
+    });
+}
 %end
 
 %hook YTAccountScopedAdsInnerTubeContextDecorator
-- (void)decorateContext:(id)context {}
+- (void)decorateContext:(id)context {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        markPlaybackDiagnostic(@"ADCTX_SC:LITE");
+    });
+}
 %end
 
 %hook YTLocalPlaybackController
@@ -490,10 +502,20 @@ YTMainAppControlsOverlayView *controlsOverlayView;
 + (id)spamSignalsDictionaryWithoutIDFA { return @{}; }
 %end
 %hook YTAdsInnerTubeContextDecorator
-- (void)decorateContext:(id)context {}
+- (void)decorateContext:(id)context {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        markPlaybackDiagnostic(@"ADCTX:FULL");
+    });
+}
 %end
 %hook YTAccountScopedAdsInnerTubeContextDecorator
-- (void)decorateContext:(id)context {}
+- (void)decorateContext:(id)context {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        markPlaybackDiagnostic(@"ADCTX_SC:FULL");
+    });
+}
 %end
 %hook YTLocalPlaybackController
 - (id)createAdsPlaybackCoordinator { return nil; }
@@ -641,6 +663,64 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
 %end
 
 static NSTimer *autoRetryPlaybackTimer = nil;
+static NSMutableArray<NSString *> *playbackDiagnosticTrail = nil;
+
+static void ensurePlaybackDiagnosticTrail() {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        playbackDiagnosticTrail = [[NSMutableArray alloc] init];
+    });
+}
+
+static void showPlaybackDiagnosticBanner(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+        if (!keyWindow && UIApplication.sharedApplication.windows.count > 0) {
+            keyWindow = UIApplication.sharedApplication.windows.firstObject;
+        }
+        if (!keyWindow) {
+            return;
+        }
+
+        const NSInteger bannerTag = 909143;
+        UILabel *label = [keyWindow viewWithTag:bannerTag];
+        if (![label isKindOfClass:[UILabel class]]) {
+            label = [[UILabel alloc] initWithFrame:CGRectZero];
+            label.tag = bannerTag;
+            label.numberOfLines = 3;
+            label.textAlignment = NSTextAlignmentCenter;
+            label.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightSemibold];
+            label.textColor = UIColor.whiteColor;
+            label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
+            label.layer.cornerRadius = 10.0;
+            label.layer.masksToBounds = YES;
+            [keyWindow addSubview:label];
+        }
+
+        CGFloat width = MIN(CGRectGetWidth(keyWindow.bounds) - 24.0, 420.0);
+        label.frame = CGRectMake((CGRectGetWidth(keyWindow.bounds) - width) / 2.0, 64.0, width, 62.0);
+        label.text = text;
+
+        [NSObject cancelPreviousPerformRequestsWithTarget:label selector:@selector(removeFromSuperview) object:nil];
+        [label performSelector:@selector(removeFromSuperview) withObject:nil afterDelay:5.0];
+    });
+}
+
+static void markPlaybackDiagnostic(NSString *eventCode) {
+    ensurePlaybackDiagnosticTrail();
+    if (!eventCode.length) {
+        return;
+    }
+    @synchronized (playbackDiagnosticTrail) {
+        [playbackDiagnosticTrail addObject:eventCode];
+        if (playbackDiagnosticTrail.count > 5) {
+            [playbackDiagnosticTrail removeObjectAtIndex:0];
+        }
+        NSString *text = [NSString stringWithFormat:@"Diag %@", [playbackDiagnosticTrail componentsJoinedByString:@" > "]];
+        NSLog(@"[uYouEnhanced][PlaybackDiag] %@", text);
+        showPlaybackDiagnosticBanner(text);
+    }
+}
 
 static void invalidateAutoRetryPlaybackTimer() {
     if (autoRetryPlaybackTimer) {
@@ -655,12 +735,16 @@ static void invalidateAutoRetryPlaybackTimer() {
 - (void)setState:(NSInteger)state {
     %orig;
 
+    markPlaybackDiagnostic([NSString stringWithFormat:@"S%ld", (long)state]);
+
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"ReloadVideos"]) {
+        markPlaybackDiagnostic(@"AUTO:DISABLED_ReloadVideos");
         invalidateAutoRetryPlaybackTimer();
         return;
     }
 
     if (state == 5 || state == 6 || state == 8) {
+        markPlaybackDiagnostic(@"AUTO:ARM");
         invalidateAutoRetryPlaybackTimer();
         __weak typeof(self) weakSelf = self;
         autoRetryPlaybackTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
@@ -669,32 +753,38 @@ static void invalidateAutoRetryPlaybackTimer() {
             autoRetryPlaybackTimer = nil;
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) {
+                markPlaybackDiagnostic(@"AUTO:ABORT_NO_PLAYER");
                 return;
             }
 
             id queueDelegate = strongSelf.delegate;
             if (!queueDelegate || ![queueDelegate respondsToSelector:@selector(delegate)]) {
+                markPlaybackDiagnostic(@"AUTO:ABORT_NO_QDELEGATE");
                 return;
             }
 
             id playbackController = [queueDelegate delegate];
             if (!playbackController || ![playbackController respondsToSelector:@selector(parentResponder)]) {
+                markPlaybackDiagnostic(@"AUTO:ABORT_NO_PLAYCTRL");
                 return;
             }
 
             id parentResponder = [playbackController parentResponder];
             if (!parentResponder) {
+                markPlaybackDiagnostic(@"AUTO:ABORT_NO_RESPONDER");
                 return;
             }
 
             Class retryEventClass = %c(YTPlayerTapToRetryResponderEvent);
             SEL eventSelector = NSSelectorFromString(@"eventWithFirstResponder:");
             if (!retryEventClass || ![retryEventClass respondsToSelector:eventSelector]) {
+                markPlaybackDiagnostic(@"AUTO:ABORT_NO_EVENTCLASS");
                 return;
             }
 
             id (*eventInvoker)(id, SEL, id) = (id (*)(id, SEL, id))[retryEventClass methodForSelector:eventSelector];
             if (!eventInvoker) {
+                markPlaybackDiagnostic(@"AUTO:ABORT_NO_EVENTINVOKER");
                 return;
             }
 
@@ -704,7 +794,12 @@ static void invalidateAutoRetryPlaybackTimer() {
                 void (*sendInvoker)(id, SEL) = (void (*)(id, SEL))[retryEvent methodForSelector:sendSelector];
                 if (sendInvoker) {
                     sendInvoker(retryEvent, sendSelector);
+                    markPlaybackDiagnostic(@"AUTO:RETRY_SENT");
+                } else {
+                    markPlaybackDiagnostic(@"AUTO:ABORT_NO_SENDINVOKER");
                 }
+            } else {
+                markPlaybackDiagnostic(@"AUTO:ABORT_NO_SENDSELECTOR");
             }
         }];
     } else {
