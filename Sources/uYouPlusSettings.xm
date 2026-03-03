@@ -4,6 +4,7 @@
 #import "ColourOptionsController2.h"
 #import "SettingsKeys.h"
 #import "AppIconOptionsController.h"
+#import "uYouPlusPatches.h"
 
 #define VERSION_STRING [[NSString stringWithFormat:@"%@", @(OS_STRINGIFY(TWEAK_VERSION))] stringByReplacingOccurrencesOfString:@"\"" withString:@""]
 #define SHOW_RELAUNCH_YT_SNACKBAR [[%c(GOOHUDManagerInternal) sharedInstance] showMessageMainThread:[%c(YTHUDMessage) messageWithText:LOC(@"RESTART_YOUTUBE")]]
@@ -104,6 +105,15 @@ static int appVersionSpoofer() { // App Version Spoofer
 static int getNotificationIconStyle() { // Notifications Tab
     return [[NSUserDefaults standardUserDefaults] integerForKey:@"notificationIconStyle"];
 }
+
+static NSString *playbackDiagnosticsSummary() {
+    NSString *failureCode = uYouEnhancedPlaybackDiagnosticsLastFailureCode();
+    if (!failureCode.length) {
+        failureCode = @"none";
+    }
+    return [NSString stringWithFormat:@"Last: %@", failureCode];
+}
+
 static const NSInteger uYouPlusSection = 500;
 
 @interface YTSettingsSectionItemManager (uYouPlus)
@@ -298,6 +308,58 @@ extern NSBundle *uYouPlusBundle();
     [sectionItems addObject:pasteSettings];
 
     SWITCH(LOC(@"REPLACE_COPY_AND_PASTE_BUTTONS"), LOC(@"REPLACE_COPY_AND_PASTE_BUTTONS_DESC"), kReplaceCopyandPasteButtons);
+
+    SECTION_HEADER(@"🧪 Playback Diagnostics");
+    SWITCH(@"Show Playback Failure Banner", @"Displays compact failure codes on playback/auth request failures.", kPlaybackDiagnosticsBanner);
+
+    YTSettingsSectionItem *copyPlaybackDiagnostics = [%c(YTSettingsSectionItem)
+        itemWithTitle:@"Copy Playback Diagnostics"
+        titleDescription:@"Copies diagnostics to clipboard and opens share sheet"
+        accessibilityIdentifier:nil
+        detailTextBlock:^NSString *() {
+            return playbackDiagnosticsSummary();
+        }
+        selectBlock:^BOOL (YTSettingsCell *cell, NSUInteger arg1) {
+            NSString *report = uYouEnhancedPlaybackDiagnosticsReport();
+            if (!report.length) {
+                report = @"No playback diagnostics captured yet.";
+            }
+
+            [UIPasteboard generalPasteboard].string = report;
+
+            NSString *reportPath = uYouEnhancedPlaybackDiagnosticsWriteReportToFile();
+            NSMutableArray *activityItems = [NSMutableArray arrayWithObject:report];
+            if (reportPath.length) {
+                [activityItems addObject:[NSURL fileURLWithPath:reportPath]];
+            }
+
+            UIActivityViewController *activityController = [[UIActivityViewController alloc] initWithActivityItems:activityItems applicationActivities:nil];
+            if (activityController.popoverPresentationController) {
+                UIView *sourceView = cell ? cell : settingsViewController.view;
+                activityController.popoverPresentationController.sourceView = sourceView;
+                activityController.popoverPresentationController.sourceRect = sourceView.bounds;
+            }
+
+            [settingsViewController presentViewController:activityController animated:YES completion:nil];
+            [[%c(GOOHUDManagerInternal) sharedInstance] showMessageMainThread:[%c(YTHUDMessage) messageWithText:@"Playback diagnostics copied"]];
+            return YES;
+        }
+    ];
+    [sectionItems addObject:copyPlaybackDiagnostics];
+
+    YTSettingsSectionItem *clearPlaybackDiagnostics = [%c(YTSettingsSectionItem)
+        itemWithTitle:@"Clear Playback Diagnostics"
+        titleDescription:@"Deletes saved playback diagnostics history"
+        accessibilityIdentifier:nil
+        detailTextBlock:nil
+        selectBlock:^BOOL (YTSettingsCell *cell, NSUInteger arg1) {
+            uYouEnhancedPlaybackDiagnosticsClear();
+            [settingsViewController reloadData];
+            [[%c(GOOHUDManagerInternal) sharedInstance] showMessageMainThread:[%c(YTHUDMessage) messageWithText:@"Playback diagnostics cleared"]];
+            return YES;
+        }
+    ];
+    [sectionItems addObject:clearPlaybackDiagnostics];
 
     YTSettingsSectionItem *exitYT = [%c(YTSettingsSectionItem)
         itemWithTitle:LOC(@"QUIT_YOUTUBE")

@@ -69,6 +69,16 @@ static BOOL const kEnableGoogleSignInBundlePatch = NO;
 static NSString *const kCachedVisitorDataKey = @"uYouEnhancedCachedVisitorData";
 static NSString *cachedVisitorData = nil;
 static BOOL visitorBootstrapRequested = NO;
+static NSString *const kPlaybackDiagLinesKey = @"uYouEnhancedPlaybackDiagLines";
+static NSString *const kPlaybackDiagLastFailureKey = @"uYouEnhancedPlaybackDiagLastFailure";
+static NSString *const kPlaybackDiagLastUpdatedKey = @"uYouEnhancedPlaybackDiagLastUpdated";
+static NSString *const kPlaybackDiagFileName = @"uYouEnhancedPlaybackDiagnostics.txt";
+static NSUInteger const kPlaybackDiagMaxLines = 120;
+static NSMutableArray<NSString *> *playbackDiagLines = nil;
+
+static NSString *playbackEndpointCodeForURL(NSURL *url);
+static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURLRequest *patchedRequest, BOOL strippedAuthHeaders, BOOL injectedVisitorHeader);
+static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLResponse *response, NSData *data, NSError *error);
 
 static dispatch_queue_t visitorDataQueue() {
     static dispatch_queue_t queue;
@@ -77,6 +87,170 @@ static dispatch_queue_t visitorDataQueue() {
         queue = dispatch_queue_create("com.uyouenhanced.visitor-data", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
+}
+
+static dispatch_queue_t playbackDiagQueue() {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.uyouenhanced.playback-diag", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static NSString *playbackDiagTimestamp(void) {
+    static NSDateFormatter *formatter;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    });
+    return [formatter stringFromDate:[NSDate date]];
+}
+
+static BOOL playbackDiagnosticsBannerEnabled(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    id bannerValue = [defaults objectForKey:kPlaybackDiagnosticsBanner];
+    if (!bannerValue) {
+        return YES;
+    }
+    return [defaults boolForKey:kPlaybackDiagnosticsBanner];
+}
+
+static void showPlaybackDiagnosticsBanner(NSString *text) {
+    if (!text.length || !playbackDiagnosticsBannerEnabled()) {
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+        if (!keyWindow && UIApplication.sharedApplication.windows.count > 0) {
+            keyWindow = UIApplication.sharedApplication.windows.firstObject;
+        }
+        if (!keyWindow) {
+            return;
+        }
+
+        const NSInteger bannerTag = 908413;
+        UILabel *label = [keyWindow viewWithTag:bannerTag];
+        if (![label isKindOfClass:[UILabel class]]) {
+            label = [[UILabel alloc] initWithFrame:CGRectZero];
+            label.tag = bannerTag;
+            label.numberOfLines = 2;
+            label.textAlignment = NSTextAlignmentCenter;
+            label.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightSemibold];
+            label.textColor = UIColor.whiteColor;
+            label.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
+            label.layer.cornerRadius = 10.0;
+            label.layer.masksToBounds = YES;
+            [keyWindow addSubview:label];
+        }
+
+        CGFloat width = MIN(CGRectGetWidth(keyWindow.bounds) - 24.0, 420.0);
+        label.frame = CGRectMake((CGRectGetWidth(keyWindow.bounds) - width) / 2.0, 64.0, width, 58.0);
+        label.text = text;
+
+        [NSObject cancelPreviousPerformRequestsWithTarget:label selector:@selector(removeFromSuperview) object:nil];
+        [label performSelector:@selector(removeFromSuperview) withObject:nil afterDelay:4.0];
+    });
+}
+
+static void ensurePlaybackDiagLinesLoaded(void) {
+    if (playbackDiagLines) {
+        return;
+    }
+    NSArray *storedLines = [[NSUserDefaults standardUserDefaults] arrayForKey:kPlaybackDiagLinesKey];
+    if ([storedLines isKindOfClass:[NSArray class]]) {
+        playbackDiagLines = [storedLines mutableCopy];
+    }
+    if (!playbackDiagLines) {
+        playbackDiagLines = [NSMutableArray array];
+    }
+}
+
+static void appendPlaybackDiagnosticLine(NSString *line, NSString *failureCode, BOOL shouldShowBanner) {
+    if (!line.length) {
+        return;
+    }
+
+    dispatch_async(playbackDiagQueue(), ^{
+        ensurePlaybackDiagLinesLoaded();
+        [playbackDiagLines addObject:line];
+        if (playbackDiagLines.count > kPlaybackDiagMaxLines) {
+            [playbackDiagLines removeObjectsInRange:NSMakeRange(0, playbackDiagLines.count - kPlaybackDiagMaxLines)];
+        }
+
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        [defaults setObject:playbackDiagLines forKey:kPlaybackDiagLinesKey];
+        [defaults setObject:[NSDate date] forKey:kPlaybackDiagLastUpdatedKey];
+
+        if (failureCode.length) {
+            [defaults setObject:failureCode forKey:kPlaybackDiagLastFailureKey];
+            if (shouldShowBanner) {
+                showPlaybackDiagnosticsBanner([NSString stringWithFormat:@"Playback %@", failureCode]);
+            }
+        }
+    });
+}
+
+NSString *uYouEnhancedPlaybackDiagnosticsLastFailureCode(void) {
+    NSString *failureCode = [[NSUserDefaults standardUserDefaults] stringForKey:kPlaybackDiagLastFailureKey];
+    return failureCode.length ? failureCode : @"none";
+}
+
+NSString *uYouEnhancedPlaybackDiagnosticsReport(void) {
+    __block NSArray<NSString *> *lines = nil;
+    dispatch_sync(playbackDiagQueue(), ^{
+        ensurePlaybackDiagLinesLoaded();
+        lines = [playbackDiagLines copy];
+    });
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *lastFailure = [defaults stringForKey:kPlaybackDiagLastFailureKey] ?: @"none";
+    NSDate *lastUpdated = [defaults objectForKey:kPlaybackDiagLastUpdatedKey];
+    NSString *appVersion = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleShortVersionString"] ?: @"unknown";
+
+    NSMutableString *report = [NSMutableString string];
+    [report appendFormat:@"uYouEnhanced Playback Diagnostics\n"]; 
+    [report appendFormat:@"App Version: %@\n", appVersion];
+    [report appendFormat:@"Isolation Stage: %ld\n", (long)kPlaybackIsolationStage];
+    [report appendFormat:@"Last Failure: %@\n", lastFailure];
+    if (lastUpdated) {
+        [report appendFormat:@"Last Updated: %@\n", [NSDateFormatter localizedStringFromDate:lastUpdated dateStyle:NSDateFormatterMediumStyle timeStyle:NSDateFormatterMediumStyle]];
+    }
+    [report appendString:@"\nRecent Events:\n"];
+
+    if (lines.count == 0) {
+        [report appendString:@"(no events captured yet)\n"];
+    } else {
+        for (NSString *line in lines) {
+            [report appendFormat:@"%@\n", line];
+        }
+    }
+
+    return report;
+}
+
+NSString *uYouEnhancedPlaybackDiagnosticsWriteReportToFile(void) {
+    NSString *report = uYouEnhancedPlaybackDiagnosticsReport();
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:kPlaybackDiagFileName];
+    NSError *writeError = nil;
+    [report writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&writeError];
+    return writeError ? nil : path;
+}
+
+void uYouEnhancedPlaybackDiagnosticsClear(void) {
+    dispatch_async(playbackDiagQueue(), ^{
+        playbackDiagLines = [NSMutableArray array];
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        [defaults removeObjectForKey:kPlaybackDiagLinesKey];
+        [defaults removeObjectForKey:kPlaybackDiagLastFailureKey];
+        [defaults removeObjectForKey:kPlaybackDiagLastUpdatedKey];
+    });
+
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:kPlaybackDiagFileName];
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
 }
 
 static NSString *trimmedString(NSString *value) {
@@ -216,6 +390,160 @@ static BOOL isBlockedSignedInHeaderField(NSString *field) {
            [lowerField isEqualToString:@"x-goog-device-auth"];
 }
 
+static NSString *playbackEndpointCodeForURL(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) {
+        return nil;
+    }
+
+    NSString *absoluteString = url.absoluteString.lowercaseString;
+    if (![absoluteString isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+
+    if ([absoluteString containsString:@"youtubei/v1/player"]) {
+        return @"IT_PLAYER";
+    }
+    if ([absoluteString containsString:@"youtubei/v1/next"]) {
+        return @"IT_NEXT";
+    }
+    if ([absoluteString containsString:@"youtubei/v1/get_watch"]) {
+        return @"IT_GET_WATCH";
+    }
+    if ([absoluteString containsString:@"youtubei/v1/reel/reel_watch_sequence"]) {
+        return @"IT_REEL_WATCH";
+    }
+    if ([absoluteString containsString:@"googlevideo.com"] && [absoluteString containsString:@"videoplayback"]) {
+        return @"GV_MEDIA";
+    }
+    return nil;
+}
+
+static NSString *playabilityStatusFromData(NSData *data) {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > (1024 * 1024)) {
+        return nil;
+    }
+
+    NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!body.length) {
+        return nil;
+    }
+
+    static NSRegularExpression *statusRegex;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        statusRegex = [NSRegularExpression regularExpressionWithPattern:@"\\\"playabilityStatus\\\"\\s*:\\s*\\{[^\\}]*\\\"status\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"" options:NSRegularExpressionCaseInsensitive error:nil];
+    });
+
+    NSTextCheckingResult *match = [statusRegex firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+    if (match.numberOfRanges >= 2) {
+        return [body substringWithRange:[match rangeAtIndex:1]];
+    }
+
+    return nil;
+}
+
+static NSString *playabilityReasonSnippetFromData(NSData *data) {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > (1024 * 1024)) {
+        return nil;
+    }
+
+    NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!body.length) {
+        return nil;
+    }
+
+    static NSRegularExpression *reasonRegex;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        reasonRegex = [NSRegularExpression regularExpressionWithPattern:@"\\\"reason\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"" options:NSRegularExpressionCaseInsensitive error:nil];
+    });
+
+    NSTextCheckingResult *match = [reasonRegex firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+    if (match.numberOfRanges < 2) {
+        return nil;
+    }
+
+    NSString *reason = [body substringWithRange:[match rangeAtIndex:1]];
+    NSString *singleLineReason = [[reason componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] componentsJoinedByString:@" "];
+    if (singleLineReason.length > 80) {
+        singleLineReason = [singleLineReason substringToIndex:80];
+    }
+    return singleLineReason;
+}
+
+static BOOL headersContainSignedInCookie(NSString *cookieHeader) {
+    if (!cookieHeader.length) {
+        return NO;
+    }
+
+    return ([cookieHeader rangeOfString:@"SAPISID" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [cookieHeader rangeOfString:@"__Secure-3PAPISID" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [cookieHeader rangeOfString:@"SID=" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [cookieHeader rangeOfString:@"HSID=" options:NSCaseInsensitiveSearch].location != NSNotFound);
+}
+
+static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURLRequest *patchedRequest, BOOL strippedAuthHeaders, BOOL injectedVisitorHeader) {
+    NSURLRequest *effectiveRequest = patchedRequest ?: originalRequest;
+    NSString *endpoint = playbackEndpointCodeForURL(effectiveRequest.URL);
+    if (!endpoint.length) {
+        return;
+    }
+
+    NSDictionary *headers = effectiveRequest.allHTTPHeaderFields;
+    NSString *authorizationHeader = headerValueForKey(headers, @"Authorization");
+    NSString *cookieHeader = headerValueForKey(headers, @"Cookie");
+    NSString *visitorHeader = headerValueForKey(headers, @"X-Goog-Visitor-Id");
+    BOOL loggedIn = headerLooksLoggedIn(headers);
+    BOOL signedInCookie = headersContainSignedInCookie(cookieHeader);
+    NSString *method = effectiveRequest.HTTPMethod ?: @"GET";
+
+    NSString *line = [NSString stringWithFormat:@"%@ %@ REQ m=%@ auth=%d cookie=%d logged=%d visitor=%d strip=%d inject=%d",
+                      playbackDiagTimestamp(),
+                      endpoint,
+                      method,
+                      authorizationHeader.length > 0 ? 1 : 0,
+                      signedInCookie ? 1 : 0,
+                      loggedIn ? 1 : 0,
+                      visitorHeader.length > 0 ? 1 : 0,
+                      strippedAuthHeaders ? 1 : 0,
+                      injectedVisitorHeader ? 1 : 0];
+    appendPlaybackDiagnosticLine(line, nil, NO);
+}
+
+static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLResponse *response, NSData *data, NSError *error) {
+    NSString *endpoint = playbackEndpointCodeForURL(request.URL);
+    if (!endpoint.length) {
+        return;
+    }
+
+    NSInteger statusCode = 0;
+    if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+        statusCode = ((NSHTTPURLResponse *)response).statusCode;
+    }
+
+    NSString *playabilityStatus = playabilityStatusFromData(data);
+    NSString *playabilityReason = playabilityReasonSnippetFromData(data);
+    NSString *line = [NSString stringWithFormat:@"%@ %@ RES status=%ld err=%d play=%@ reason=%@ bytes=%lu",
+                      playbackDiagTimestamp(),
+                      endpoint,
+                      (long)statusCode,
+                      error ? 1 : 0,
+                      playabilityStatus ?: @"-",
+                      playabilityReason ?: @"-",
+                      (unsigned long)data.length];
+
+    NSString *failureCode = nil;
+    if (error) {
+        failureCode = [NSString stringWithFormat:@"%@_ERR", endpoint];
+    } else if (statusCode >= 400) {
+        failureCode = [NSString stringWithFormat:@"%@_%ld", endpoint, (long)statusCode];
+    } else if (playabilityStatus.length && ![playabilityStatus isEqualToString:@"OK"]) {
+        failureCode = [NSString stringWithFormat:@"%@_PLAY_%@", endpoint, playabilityStatus];
+    }
+
+    appendPlaybackDiagnosticLine(line, failureCode, YES);
+}
+
 static NSString *extractVisitorDataFromURL(NSURL *url) {
     if (![url isKindOfClass:[NSURL class]]) {
         return nil;
@@ -309,6 +637,7 @@ static void bootstrapVisitorDataFromWebIfNeeded(void) {
 
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error) {
+            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ VISITOR_BOOTSTRAP ERR", playbackDiagTimestamp()], @"VISITOR_BOOTSTRAP_ERR", NO);
             return;
         }
 
@@ -327,6 +656,9 @@ static void bootstrapVisitorDataFromWebIfNeeded(void) {
         NSString *resolvedVisitorData = visitorDataFromHeaders.length ? visitorDataFromHeaders : extractVisitorDataFromBody(data);
         if (resolvedVisitorData.length) {
             cacheVisitorData(resolvedVisitorData);
+            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ VISITOR_BOOTSTRAP OK source=%@", playbackDiagTimestamp(), visitorDataFromHeaders.length ? @"header" : @"body"], nil, NO);
+        } else {
+            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ VISITOR_BOOTSTRAP EMPTY", playbackDiagTimestamp()], @"VISITOR_BOOTSTRAP_EMPTY", NO);
         }
     }];
     [task resume];
@@ -350,13 +682,7 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
     NSString *cookieHeader = headerValueForKey(headers, @"Cookie");
     NSString *authUserHeader = headerValueForKey(headers, @"X-Goog-AuthUser");
 
-    BOOL hasSignedInCookie = NO;
-    if (cookieHeader.length) {
-        hasSignedInCookie = ([cookieHeader rangeOfString:@"SAPISID" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                             [cookieHeader rangeOfString:@"__Secure-3PAPISID" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                             [cookieHeader rangeOfString:@"SID=" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                             [cookieHeader rangeOfString:@"HSID=" options:NSCaseInsensitiveSearch].location != NSNotFound);
-    }
+    BOOL hasSignedInCookie = headersContainSignedInCookie(cookieHeader);
     BOOL shouldStripSignedInHeadersForPlayback = shouldNormalizePlaybackIdentity &&
         (authorizationHeader.length > 0 || authUserHeader.length > 0 || hasSignedInCookie || headerLooksLoggedIn(headers));
 
@@ -394,6 +720,7 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
     }
 
     if (!shouldStripSignedInHeadersForPlayback && !shouldInjectVisitorHeader) {
+        recordPlaybackRequestDiagnostic(request, nil, NO, NO);
         return request;
     }
 
@@ -411,6 +738,8 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
         [mutableRequest setValue:@"0" forHTTPHeaderField:@"X-Goog-Logged-In"];
         [mutableRequest setValue:@"0" forHTTPHeaderField:@"X-Youtube-Bootstrap-Logged-In"];
     }
+
+    recordPlaybackRequestDiagnostic(request, mutableRequest, shouldStripSignedInHeadersForPlayback, shouldInjectVisitorHeader);
 
     return mutableRequest;
 }
@@ -488,6 +817,7 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
     NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
     void (^wrappedCompletion)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
         cacheVisitorDataFromResponse(response, data);
+        recordPlaybackResponseDiagnostic(patchedRequest, response, data, error);
         if (completionHandler) {
             completionHandler(data, response, error);
         }
@@ -499,6 +829,7 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
     NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
     void (^wrappedCompletion)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
         cacheVisitorDataFromResponse(response, data);
+        recordPlaybackResponseDiagnostic(patchedRequest, response, data, error);
         if (completionHandler) {
             completionHandler(data, response, error);
         }
@@ -890,6 +1221,12 @@ static void refreshUYouAppearance() {
     if (kPlaybackIsolationStage == 0) {
         return;
     }
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (![defaults objectForKey:kPlaybackDiagnosticsBanner]) {
+        [defaults setBool:YES forKey:kPlaybackDiagnosticsBanner];
+    }
+    appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ APP_INIT stage=%ld", playbackDiagTimestamp(), (long)kPlaybackIsolationStage], nil, NO);
 
     bootstrapVisitorDataFromWebIfNeeded();
     %init(gGoogleSignInPatch);

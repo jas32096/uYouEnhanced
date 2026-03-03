@@ -107,3 +107,8 @@
 @property (nonatomic, copy, readwrite) NSString *serializedShareEntity;
 + (GPBExtensionDescriptor*)shareEntityEndpoint;
 @end
+
+FOUNDATION_EXPORT NSString *uYouEnhancedPlaybackDiagnosticsReport(void);
+FOUNDATION_EXPORT NSString *uYouEnhancedPlaybackDiagnosticsWriteReportToFile(void);
+FOUNDATION_EXPORT NSString *uYouEnhancedPlaybackDiagnosticsLastFailureCode(void);
+FOUNDATION_EXPORT void uYouEnhancedPlaybackDiagnosticsClear(void);
