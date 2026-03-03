@@ -2,7 +2,7 @@
 
 #define YT_BUNDLE_ID @"com.google.ios.youtube"
 #define YT_NAME @"YouTube"
-static NSInteger const kPlaybackIsolationStage = 3;
+static NSInteger const kPlaybackIsolationStage = 1;
 
 # pragma mark - YouTube patches
 
@@ -55,6 +55,7 @@ static NSInteger const kPlaybackIsolationStage = 3;
 
 static NSString *const kCachedVisitorDataKey = @"uYouEnhancedCachedVisitorData";
 static NSString *cachedVisitorData = nil;
+static BOOL visitorBootstrapRequested = NO;
 
 static dispatch_queue_t visitorDataQueue() {
     static dispatch_queue_t queue;
@@ -73,6 +74,36 @@ static NSString *trimmedString(NSString *value) {
     return trimmed.length ? trimmed : nil;
 }
 
+static NSString *invokeStringSelectorNoArgs(id target, SEL selector) {
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return nil;
+    }
+    id (*invoker)(id, SEL) = (id (*)(id, SEL))[target methodForSelector:selector];
+    if (!invoker) {
+        return nil;
+    }
+    return trimmedString(invoker(target, selector));
+}
+
+static id invokeObjectSelectorNoArgs(id target, SEL selector) {
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return nil;
+    }
+    id (*invoker)(id, SEL) = (id (*)(id, SEL))[target methodForSelector:selector];
+    return invoker ? invoker(target, selector) : nil;
+}
+
+static void invokeVoidSelectorStringArg(id target, SEL selector, NSString *value) {
+    if (!target || !selector || ![target respondsToSelector:selector] || !value.length) {
+        return;
+    }
+    void (*invoker)(id, SEL, id) = (void (*)(id, SEL, id))[target methodForSelector:selector];
+    if (!invoker) {
+        return;
+    }
+    invoker(target, selector, value);
+}
+
 static NSString *headerValueForKey(NSDictionary *headers, NSString *targetKey) {
     if (![headers isKindOfClass:[NSDictionary class]] || !targetKey.length) {
         return nil;
@@ -88,6 +119,62 @@ static NSString *headerValueForKey(NSDictionary *headers, NSString *targetKey) {
         }
     }];
     return value;
+}
+
+static NSString *extractVisitorDataFromCookies(NSString *cookieHeaderValue) {
+    NSString *cookieString = trimmedString(cookieHeaderValue);
+    if (!cookieString.length) {
+        return nil;
+    }
+
+    NSArray<NSString *> *segments = [cookieString componentsSeparatedByString:@";"];
+    for (NSString *segment in segments) {
+        NSArray<NSString *> *pair = [segment componentsSeparatedByString:@"="];
+        if (pair.count < 2) {
+            continue;
+        }
+        NSString *key = [trimmedString(pair.firstObject).lowercaseString copy];
+        if ([key isEqualToString:@"visitor_info1_live"] || [key isEqualToString:@"visitor_data"]) {
+            NSString *value = trimmedString([[pair subarrayWithRange:NSMakeRange(1, pair.count - 1)] componentsJoinedByString:@"="]);
+            if (value.length) {
+                return value;
+            }
+        }
+    }
+    return nil;
+}
+
+static NSString *extractVisitorDataFromSetCookieHeader(NSDictionary *headers) {
+    if (![headers isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+
+    NSString *singleSetCookie = headerValueForKey(headers, @"Set-Cookie");
+    NSString *visitorData = extractVisitorDataFromCookies(singleSetCookie);
+    if (visitorData.length) {
+        return visitorData;
+    }
+
+    __block NSString *arrayVisitorData = nil;
+    [headers enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+        if (![key isKindOfClass:[NSString class]]) {
+            return;
+        }
+        if ([(NSString *)key caseInsensitiveCompare:@"Set-Cookie"] != NSOrderedSame) {
+            return;
+        }
+        if ([obj isKindOfClass:[NSArray class]]) {
+            for (id item in (NSArray *)obj) {
+                arrayVisitorData = extractVisitorDataFromCookies(item);
+                if (arrayVisitorData.length) {
+                    *stop = YES;
+                    break;
+                }
+            }
+        }
+    }];
+
+    return arrayVisitorData;
 }
 
 static BOOL isInnerTubeRequest(NSURL *url) {
@@ -178,6 +265,66 @@ static NSString *currentVisitorData() {
     return value;
 }
 
+static void persistVisitorDataToRuntimeObjects(NSString *visitorData) {
+    NSString *value = trimmedString(visitorData);
+    if (!value.length) {
+        return;
+    }
+
+    Class ytUserDefaultsClass = NSClassFromString(@"YTUserDefaults");
+    id ytUserDefaults = nil;
+    if ([ytUserDefaultsClass respondsToSelector:@selector(standardUserDefaults)]) {
+        ytUserDefaults = invokeObjectSelectorNoArgs(ytUserDefaultsClass, @selector(standardUserDefaults));
+    }
+    if (!ytUserDefaults && [ytUserDefaultsClass respondsToSelector:@selector(sharedInstance)]) {
+        id (*sharedInstanceInvoker)(id, SEL) = (id (*)(id, SEL))[ytUserDefaultsClass methodForSelector:@selector(sharedInstance)];
+        ytUserDefaults = sharedInstanceInvoker ? sharedInstanceInvoker(ytUserDefaultsClass, @selector(sharedInstance)) : nil;
+    }
+    invokeVoidSelectorStringArg(ytUserDefaults, @selector(setVisitorData:), value);
+    invokeVoidSelectorStringArg(ytUserDefaults, @selector(setIncognitoVisitorData:), value);
+}
+
+static void bootstrapVisitorDataFromWebIfNeeded(void) {
+    if (visitorBootstrapRequested || currentVisitorData().length) {
+        return;
+    }
+
+    visitorBootstrapRequested = YES;
+    NSURL *url = [NSURL URLWithString:@"https://www.youtube.com"];
+    if (!url) {
+        return;
+    }
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:12.0];
+    [request setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1" forHTTPHeaderField:@"User-Agent"];
+    [request setValue:@"en-US,en;q=0.9" forHTTPHeaderField:@"Accept-Language"];
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error) {
+            return;
+        }
+
+        NSString *visitorDataFromHeaders = nil;
+        if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+            NSDictionary *headers = ((NSHTTPURLResponse *)response).allHeaderFields;
+            visitorDataFromHeaders = headerValueForKey(headers, @"X-Goog-Visitor-Id");
+            if (!visitorDataFromHeaders.length) {
+                visitorDataFromHeaders = headerValueForKey(headers, @"X-Youtube-Client-Visitor-Id");
+            }
+            if (!visitorDataFromHeaders.length) {
+                visitorDataFromHeaders = extractVisitorDataFromSetCookieHeader(headers);
+            }
+        }
+
+        NSString *resolvedVisitorData = visitorDataFromHeaders.length ? visitorDataFromHeaders : extractVisitorDataFromBody(data);
+        if (resolvedVisitorData.length) {
+            cacheVisitorData(resolvedVisitorData);
+            persistVisitorDataToRuntimeObjects(resolvedVisitorData);
+        }
+    }];
+    [task resume];
+}
+
 static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request) {
     if (![request isKindOfClass:[NSURLRequest class]] || !isInnerTubeRequest(request.URL)) {
         return request;
@@ -186,6 +333,14 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
     NSString *visitorDataFromHeaders = headerValueForKey(request.allHTTPHeaderFields, @"X-Goog-Visitor-Id");
     if (visitorDataFromHeaders.length) {
         cacheVisitorData(visitorDataFromHeaders);
+        persistVisitorDataToRuntimeObjects(visitorDataFromHeaders);
+        return request;
+    }
+
+    NSString *visitorDataFromCookie = extractVisitorDataFromCookies(headerValueForKey(request.allHTTPHeaderFields, @"Cookie"));
+    if (visitorDataFromCookie.length) {
+        cacheVisitorData(visitorDataFromCookie);
+        persistVisitorDataToRuntimeObjects(visitorDataFromCookie);
         return request;
     }
 
@@ -197,6 +352,7 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
         visitorData = extractVisitorDataFromBody(request.HTTPBody);
     }
     if (!visitorData.length) {
+        bootstrapVisitorDataFromWebIfNeeded();
         return request;
     }
 
@@ -212,8 +368,12 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
         if (!visitorDataFromHeaders.length) {
             visitorDataFromHeaders = headerValueForKey(headers, @"X-Youtube-Client-Visitor-Id");
         }
+        if (!visitorDataFromHeaders.length) {
+            visitorDataFromHeaders = extractVisitorDataFromSetCookieHeader(headers);
+        }
         if (visitorDataFromHeaders.length) {
             cacheVisitorData(visitorDataFromHeaders);
+            persistVisitorDataToRuntimeObjects(visitorDataFromHeaders);
             return;
         }
     }
@@ -221,9 +381,11 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
     NSString *visitorDataFromBody = extractVisitorDataFromBody(data);
     if (visitorDataFromBody.length) {
         cacheVisitorData(visitorDataFromBody);
+        persistVisitorDataToRuntimeObjects(visitorDataFromBody);
     }
 }
 
+%group gVisitorDataFix
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
     if ([field isKindOfClass:[NSString class]] && [field caseInsensitiveCompare:@"X-Goog-Visitor-Id"] == NSOrderedSame) {
@@ -264,6 +426,141 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
     };
     return %orig(patchedRequest, bodyData, wrappedCompletion);
 }
+%end
+
+%hook YTNetRequestDecorator
++ (void)addVisitorDataToRequest:(id)request visitorData:(id)visitorData {
+    NSString *resolvedVisitorData = trimmedString(visitorData);
+    if (!resolvedVisitorData.length) {
+        resolvedVisitorData = currentVisitorData();
+    }
+    if (!resolvedVisitorData.length) {
+        bootstrapVisitorDataFromWebIfNeeded();
+        %orig;
+        return;
+    }
+    cacheVisitorData(resolvedVisitorData);
+    persistVisitorDataToRuntimeObjects(resolvedVisitorData);
+    %orig(request, resolvedVisitorData);
+}
+%end
+
+%hook YTUserDefaults
+- (NSString *)visitorData {
+    NSString *originalValue = %orig;
+    NSString *value = trimmedString(originalValue);
+    if (value.length) {
+        cacheVisitorData(value);
+        return originalValue;
+    }
+
+    NSString *fallback = currentVisitorData();
+    if (!fallback.length) {
+        fallback = invokeStringSelectorNoArgs(self, @selector(incognitoVisitorData));
+    }
+    if (fallback.length) {
+        invokeVoidSelectorStringArg(self, @selector(setVisitorData:), fallback);
+        return fallback;
+    }
+
+    bootstrapVisitorDataFromWebIfNeeded();
+    return originalValue;
+}
+
+- (void)setVisitorData:(NSString *)visitorData {
+    cacheVisitorData(visitorData);
+    %orig;
+}
+
+- (NSString *)incognitoVisitorData {
+    NSString *originalValue = %orig;
+    NSString *value = trimmedString(originalValue);
+    if (value.length) {
+        cacheVisitorData(value);
+        return originalValue;
+    }
+
+    NSString *fallback = currentVisitorData();
+    if (fallback.length) {
+        invokeVoidSelectorStringArg(self, @selector(setIncognitoVisitorData:), fallback);
+        return fallback;
+    }
+
+    return originalValue;
+}
+
+- (void)setIncognitoVisitorData:(NSString *)visitorData {
+    cacheVisitorData(visitorData);
+    %orig;
+}
+
+- (_Bool)isVisitorDataBugFixed {
+    return YES;
+}
+
+- (void)setIsVisitorDataBugFixed:(_Bool)fixed {
+    %orig(YES);
+}
+%end
+
+%hook YTSignedOutIdentityProvider
+- (NSString *)visitorData {
+    NSString *originalValue = %orig;
+    NSString *value = trimmedString(originalValue);
+    if (value.length) {
+        cacheVisitorData(value);
+        return originalValue;
+    }
+
+    NSString *fallback = currentVisitorData();
+    if (fallback.length) {
+        invokeVoidSelectorStringArg(self, @selector(setVisitorData:), fallback);
+        return fallback;
+    }
+
+    bootstrapVisitorDataFromWebIfNeeded();
+    return originalValue;
+}
+
+- (void)setVisitorData:(NSString *)visitorData {
+    cacheVisitorData(visitorData);
+    %orig;
+}
+%end
+
+%hook YTInnerTubeRequest
+- (NSString *)visitorData {
+    NSString *originalValue = %orig;
+    NSString *value = trimmedString(originalValue);
+    if (value.length) {
+        cacheVisitorData(value);
+        return originalValue;
+    }
+
+    NSString *fallback = currentVisitorData();
+    if (fallback.length) {
+        return fallback;
+    }
+
+    bootstrapVisitorDataFromWebIfNeeded();
+    return originalValue;
+}
+%end
+
+%hook YTInnerTubeRequestFactory
+- (id)requestForProtoRequest:(id)protoRequest withService:(long long)service identityID:(id)identityID visitorData:(id)visitorData needsClickTrackingParams:(_Bool)needsClickTrackingParams clickTrackingParamsOverride:(id)clickTrackingParamsOverride sendDeviceIdentifier:(_Bool)sendDeviceIdentifier skipCacheLookup:(_Bool)skipCacheLookup {
+    NSString *resolvedVisitorData = trimmedString(visitorData);
+    if (!resolvedVisitorData.length) {
+        resolvedVisitorData = currentVisitorData();
+    }
+    if (resolvedVisitorData.length) {
+        cacheVisitorData(resolvedVisitorData);
+        return %orig(protoRequest, service, identityID, resolvedVisitorData, needsClickTrackingParams, clickTrackingParamsOverride, sendDeviceIdentifier, skipCacheLookup);
+    }
+    bootstrapVisitorDataFromWebIfNeeded();
+    return %orig;
+}
+%end
 %end
 
 // Reposition "Create" Tab to the Center in the Pivot Bar - qnblackcat/uYouPlus#107
@@ -649,15 +946,15 @@ static void refreshUYouAppearance() {
         return;
     }
 
-    if (kPlaybackIsolationStage >= 2) {
-        %init;
-    }
-
+    bootstrapVisitorDataFromWebIfNeeded();
     %init(gGoogleSignInPatch);
+    %init(gVisitorDataFix);
 
     if (kPlaybackIsolationStage == 1) {
         return;
     }
+
+    %init;
 /*
     if (IS_ENABLED(kYouTubeNativeShare)) {
         %init(gYouTubeNativeShare);

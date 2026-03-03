@@ -15,7 +15,7 @@ NSBundle *uYouPlusBundle() {
     return bundle;
 }
 NSBundle *tweakBundle = uYouPlusBundle();
-static NSInteger const kPlaybackIsolationStage = 3;
+static NSInteger const kPlaybackIsolationStage = 1;
 //
 
 // Notifications Tab appearance
@@ -1898,7 +1898,7 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
 
 # pragma mark - ctor
 %ctor {
-    if (kPlaybackIsolationStage <= 1) {
+    if (kPlaybackIsolationStage <= 2) {
         return;
     }
 
