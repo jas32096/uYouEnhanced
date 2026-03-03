@@ -178,6 +178,7 @@ static NSString *const kHideSubscriptionsNotificationBadge = @"hideSubscriptions
 static NSString *const kFixCasting = @"fixCasting_enabled";
 static NSString *const kAutoRetryPlayback = @"autoRetryPlayback_enabled";
 static NSString *const kPlaybackDiagnosticsBanner = @"playbackDiagnosticsBanner_enabled";
+static NSString *const kPlaybackDiagnosticsAutoCopy = @"playbackDiagnosticsAutoCopy_enabled";
 static NSString *const kNewSettingsUI = @"newSettingsUI_enabled";
 static NSString *const kFlex = @"flex_enabled";
 // unused (uYouEnhanced)

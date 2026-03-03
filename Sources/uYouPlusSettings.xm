@@ -311,6 +311,7 @@ extern NSBundle *uYouPlusBundle();
 
     SECTION_HEADER(@"🧪 Playback Diagnostics");
     SWITCH(@"Show Playback Failure Banner", @"Displays compact failure codes on playback/auth request failures.", kPlaybackDiagnosticsBanner);
+    SWITCH(@"Auto-Copy Diagnostics On Failure", @"Automatically copies diagnostics report and file path to clipboard on each new failure code.", kPlaybackDiagnosticsAutoCopy);
 
     YTSettingsSectionItem *copyPlaybackDiagnostics = [%c(YTSettingsSectionItem)
         itemWithTitle:@"Copy Playback Diagnostics"

@@ -74,11 +74,15 @@ static NSString *const kPlaybackDiagLastFailureKey = @"uYouEnhancedPlaybackDiagL
 static NSString *const kPlaybackDiagLastUpdatedKey = @"uYouEnhancedPlaybackDiagLastUpdated";
 static NSString *const kPlaybackDiagFileName = @"uYouEnhancedPlaybackDiagnostics.txt";
 static NSUInteger const kPlaybackDiagMaxLines = 120;
+static NSTimeInterval const kPlaybackDiagAutoCopyThrottleSeconds = 8.0;
 static NSMutableArray<NSString *> *playbackDiagLines = nil;
+static NSString *playbackDiagLastAutoCopiedFailure = nil;
+static NSDate *playbackDiagLastAutoCopiedAt = nil;
 
 static NSString *playbackEndpointCodeForURL(NSURL *url);
 static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURLRequest *patchedRequest, BOOL strippedAuthHeaders, BOOL injectedVisitorHeader);
 static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLResponse *response, NSData *data, NSError *error);
+static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *failureCode);
 
 static dispatch_queue_t visitorDataQueue() {
     static dispatch_queue_t queue;
@@ -116,6 +120,15 @@ static BOOL playbackDiagnosticsBannerEnabled(void) {
         return YES;
     }
     return [defaults boolForKey:kPlaybackDiagnosticsBanner];
+}
+
+static BOOL playbackDiagnosticsAutoCopyEnabled(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    id autoCopyValue = [defaults objectForKey:kPlaybackDiagnosticsAutoCopy];
+    if (!autoCopyValue) {
+        return YES;
+    }
+    return [defaults boolForKey:kPlaybackDiagnosticsAutoCopy];
 }
 
 static void showPlaybackDiagnosticsBanner(NSString *text) {
@@ -190,6 +203,7 @@ static void appendPlaybackDiagnosticLine(NSString *line, NSString *failureCode, 
             if (shouldShowBanner) {
                 showPlaybackDiagnosticsBanner([NSString stringWithFormat:@"Playback %@", failureCode]);
             }
+            autoCopyPlaybackDiagnosticsIfNeeded(failureCode);
         }
     });
 }
@@ -240,9 +254,44 @@ NSString *uYouEnhancedPlaybackDiagnosticsWriteReportToFile(void) {
     return writeError ? nil : path;
 }
 
+static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *failureCode) {
+    if (!failureCode.length || !playbackDiagnosticsAutoCopyEnabled()) {
+        return;
+    }
+
+    NSDate *now = [NSDate date];
+    BOOL isSameFailureCode = [playbackDiagLastAutoCopiedFailure isEqualToString:failureCode];
+    if (isSameFailureCode && playbackDiagLastAutoCopiedAt && [now timeIntervalSinceDate:playbackDiagLastAutoCopiedAt] < kPlaybackDiagAutoCopyThrottleSeconds) {
+        return;
+    }
+
+    playbackDiagLastAutoCopiedFailure = [failureCode copy];
+    playbackDiagLastAutoCopiedAt = now;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *report = uYouEnhancedPlaybackDiagnosticsReport();
+        NSString *reportPath = uYouEnhancedPlaybackDiagnosticsWriteReportToFile();
+
+        NSMutableString *clipboardPayload = [NSMutableString string];
+        if (report.length) {
+            [clipboardPayload appendString:report];
+        }
+        if (reportPath.length) {
+            [clipboardPayload appendFormat:@"\n\nDiagnostics file: %@\n", reportPath];
+        }
+        if (!clipboardPayload.length) {
+            [clipboardPayload appendString:@"Playback diagnostics unavailable."];
+        }
+
+        [UIPasteboard generalPasteboard].string = clipboardPayload;
+    });
+}
+
 void uYouEnhancedPlaybackDiagnosticsClear(void) {
     dispatch_async(playbackDiagQueue(), ^{
         playbackDiagLines = [NSMutableArray array];
+        playbackDiagLastAutoCopiedFailure = nil;
+        playbackDiagLastAutoCopiedAt = nil;
         NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
         [defaults removeObjectForKey:kPlaybackDiagLinesKey];
         [defaults removeObjectForKey:kPlaybackDiagLastFailureKey];
@@ -1226,7 +1275,13 @@ static void refreshUYouAppearance() {
     if (![defaults objectForKey:kPlaybackDiagnosticsBanner]) {
         [defaults setBool:YES forKey:kPlaybackDiagnosticsBanner];
     }
+    if (![defaults objectForKey:kPlaybackDiagnosticsAutoCopy]) {
+        [defaults setBool:YES forKey:kPlaybackDiagnosticsAutoCopy];
+    }
     appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ APP_INIT stage=%ld", playbackDiagTimestamp(), (long)kPlaybackIsolationStage], nil, NO);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1800 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        showPlaybackDiagnosticsBanner(@"Playback diagnostics active");
+    });
 
     bootstrapVisitorDataFromWebIfNeeded();
     %init(gGoogleSignInPatch);
