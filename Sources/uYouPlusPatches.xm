@@ -159,6 +159,17 @@ static BOOL isInnerTubeRequest(NSURL *url) {
             [absoluteString containsString:@"youtubei.googleapis.com"]);
 }
 
+static BOOL isInnerTubePlayerRequest(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) {
+        return NO;
+    }
+    NSString *absoluteString = url.absoluteString.lowercaseString;
+    if (![absoluteString isKindOfClass:[NSString class]]) {
+        return NO;
+    }
+    return [absoluteString containsString:@"youtubei/v1/player"];
+}
+
 static NSString *extractVisitorDataFromURL(NSURL *url) {
     if (![url isKindOfClass:[NSURL class]]) {
         return nil;
@@ -280,6 +291,13 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
         return request;
     }
 
+    BOOL shouldStripSignedInHeadersForPlayer = NO;
+    if (isInnerTubePlayerRequest(request.URL)) {
+        NSString *authorizationHeader = headerValueForKey(request.allHTTPHeaderFields, @"Authorization");
+        NSString *cookieHeader = headerValueForKey(request.allHTTPHeaderFields, @"Cookie");
+        shouldStripSignedInHeadersForPlayer = (authorizationHeader.length > 0 || [cookieHeader rangeOfString:@"SAPISID" options:NSCaseInsensitiveSearch].location != NSNotFound);
+    }
+
     NSString *visitorDataFromHeaders = headerValueForKey(request.allHTTPHeaderFields, @"X-Goog-Visitor-Id");
     if (visitorDataFromHeaders.length) {
         cacheVisitorData(visitorDataFromHeaders);
@@ -306,6 +324,17 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
 
     NSMutableURLRequest *mutableRequest = [request mutableCopy];
     [mutableRequest setValue:visitorData forHTTPHeaderField:@"X-Goog-Visitor-Id"];
+
+    if (shouldStripSignedInHeadersForPlayer) {
+        [mutableRequest setValue:nil forHTTPHeaderField:@"Authorization"];
+        [mutableRequest setValue:nil forHTTPHeaderField:@"Cookie"];
+        [mutableRequest setValue:nil forHTTPHeaderField:@"X-Goog-AuthUser"];
+        [mutableRequest setValue:nil forHTTPHeaderField:@"X-Goog-PageId"];
+        [mutableRequest setValue:nil forHTTPHeaderField:@"X-Goog-Device-Auth"];
+        [mutableRequest setValue:@"0" forHTTPHeaderField:@"X-Goog-Logged-In"];
+        [mutableRequest setValue:@"0" forHTTPHeaderField:@"X-Youtube-Bootstrap-Logged-In"];
+    }
+
     return mutableRequest;
 }
 
