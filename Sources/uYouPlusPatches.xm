@@ -244,22 +244,24 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
     NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
-    return %orig(patchedRequest, ^(NSData *data, NSURLResponse *response, NSError *error) {
+    void (^wrappedCompletion)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
         cacheVisitorDataFromResponse(response, data);
         if (completionHandler) {
             completionHandler(data, response, error);
         }
-    });
+    };
+    return %orig(patchedRequest, wrappedCompletion);
 }
 
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
     NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
-    return %orig(patchedRequest, bodyData, ^(NSData *data, NSURLResponse *response, NSError *error) {
+    void (^wrappedCompletion)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
         cacheVisitorDataFromResponse(response, data);
         if (completionHandler) {
             completionHandler(data, response, error);
         }
-    });
+    };
+    return %orig(patchedRequest, bodyData, wrappedCompletion);
 }
 %end
 
