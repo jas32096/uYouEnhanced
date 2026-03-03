@@ -15,7 +15,7 @@ NSBundle *uYouPlusBundle() {
     return bundle;
 }
 NSBundle *tweakBundle = uYouPlusBundle();
-static NSInteger const kPlaybackIsolationStage = 2;
+static NSInteger const kPlaybackIsolationStage = 3;
 //
 
 // Notifications Tab appearance
