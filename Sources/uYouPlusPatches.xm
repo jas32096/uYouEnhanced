@@ -2,7 +2,7 @@
 
 #define YT_BUNDLE_ID @"com.google.ios.youtube"
 #define YT_NAME @"YouTube"
-static NSInteger const kPlaybackIsolationStage = 0;
+static NSInteger const kPlaybackIsolationStage = 1;
 
 # pragma mark - YouTube patches
 
