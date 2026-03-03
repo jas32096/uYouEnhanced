@@ -74,36 +74,6 @@ static NSString *trimmedString(NSString *value) {
     return trimmed.length ? trimmed : nil;
 }
 
-static NSString *invokeStringSelectorNoArgs(id target, SEL selector) {
-    if (!target || !selector || ![target respondsToSelector:selector]) {
-        return nil;
-    }
-    id (*invoker)(id, SEL) = (id (*)(id, SEL))[target methodForSelector:selector];
-    if (!invoker) {
-        return nil;
-    }
-    return trimmedString(invoker(target, selector));
-}
-
-static id invokeObjectSelectorNoArgs(id target, SEL selector) {
-    if (!target || !selector || ![target respondsToSelector:selector]) {
-        return nil;
-    }
-    id (*invoker)(id, SEL) = (id (*)(id, SEL))[target methodForSelector:selector];
-    return invoker ? invoker(target, selector) : nil;
-}
-
-static void invokeVoidSelectorStringArg(id target, SEL selector, NSString *value) {
-    if (!target || !selector || ![target respondsToSelector:selector] || !value.length) {
-        return;
-    }
-    void (*invoker)(id, SEL, id) = (void (*)(id, SEL, id))[target methodForSelector:selector];
-    if (!invoker) {
-        return;
-    }
-    invoker(target, selector, value);
-}
-
 static NSString *headerValueForKey(NSDictionary *headers, NSString *targetKey) {
     if (![headers isKindOfClass:[NSDictionary class]] || !targetKey.length) {
         return nil;
@@ -265,25 +235,6 @@ static NSString *currentVisitorData() {
     return value;
 }
 
-static void persistVisitorDataToRuntimeObjects(NSString *visitorData) {
-    NSString *value = trimmedString(visitorData);
-    if (!value.length) {
-        return;
-    }
-
-    Class ytUserDefaultsClass = NSClassFromString(@"YTUserDefaults");
-    id ytUserDefaults = nil;
-    if ([ytUserDefaultsClass respondsToSelector:@selector(standardUserDefaults)]) {
-        ytUserDefaults = invokeObjectSelectorNoArgs(ytUserDefaultsClass, @selector(standardUserDefaults));
-    }
-    if (!ytUserDefaults && [ytUserDefaultsClass respondsToSelector:@selector(sharedInstance)]) {
-        id (*sharedInstanceInvoker)(id, SEL) = (id (*)(id, SEL))[ytUserDefaultsClass methodForSelector:@selector(sharedInstance)];
-        ytUserDefaults = sharedInstanceInvoker ? sharedInstanceInvoker(ytUserDefaultsClass, @selector(sharedInstance)) : nil;
-    }
-    invokeVoidSelectorStringArg(ytUserDefaults, @selector(setVisitorData:), value);
-    invokeVoidSelectorStringArg(ytUserDefaults, @selector(setIncognitoVisitorData:), value);
-}
-
 static void bootstrapVisitorDataFromWebIfNeeded(void) {
     if (visitorBootstrapRequested || currentVisitorData().length) {
         return;
@@ -319,7 +270,6 @@ static void bootstrapVisitorDataFromWebIfNeeded(void) {
         NSString *resolvedVisitorData = visitorDataFromHeaders.length ? visitorDataFromHeaders : extractVisitorDataFromBody(data);
         if (resolvedVisitorData.length) {
             cacheVisitorData(resolvedVisitorData);
-            persistVisitorDataToRuntimeObjects(resolvedVisitorData);
         }
     }];
     [task resume];
@@ -333,14 +283,12 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
     NSString *visitorDataFromHeaders = headerValueForKey(request.allHTTPHeaderFields, @"X-Goog-Visitor-Id");
     if (visitorDataFromHeaders.length) {
         cacheVisitorData(visitorDataFromHeaders);
-        persistVisitorDataToRuntimeObjects(visitorDataFromHeaders);
         return request;
     }
 
     NSString *visitorDataFromCookie = extractVisitorDataFromCookies(headerValueForKey(request.allHTTPHeaderFields, @"Cookie"));
     if (visitorDataFromCookie.length) {
         cacheVisitorData(visitorDataFromCookie);
-        persistVisitorDataToRuntimeObjects(visitorDataFromCookie);
         return request;
     }
 
@@ -373,7 +321,6 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
         }
         if (visitorDataFromHeaders.length) {
             cacheVisitorData(visitorDataFromHeaders);
-            persistVisitorDataToRuntimeObjects(visitorDataFromHeaders);
             return;
         }
     }
@@ -381,7 +328,6 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
     NSString *visitorDataFromBody = extractVisitorDataFromBody(data);
     if (visitorDataFromBody.length) {
         cacheVisitorData(visitorDataFromBody);
-        persistVisitorDataToRuntimeObjects(visitorDataFromBody);
     }
 }
 
@@ -425,140 +371,6 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
         }
     };
     return %orig(patchedRequest, bodyData, wrappedCompletion);
-}
-%end
-
-%hook YTNetRequestDecorator
-+ (void)addVisitorDataToRequest:(id)request visitorData:(id)visitorData {
-    NSString *resolvedVisitorData = trimmedString(visitorData);
-    if (!resolvedVisitorData.length) {
-        resolvedVisitorData = currentVisitorData();
-    }
-    if (!resolvedVisitorData.length) {
-        bootstrapVisitorDataFromWebIfNeeded();
-        %orig;
-        return;
-    }
-    cacheVisitorData(resolvedVisitorData);
-    persistVisitorDataToRuntimeObjects(resolvedVisitorData);
-    %orig(request, resolvedVisitorData);
-}
-%end
-
-%hook YTUserDefaults
-- (NSString *)visitorData {
-    NSString *originalValue = %orig;
-    NSString *value = trimmedString(originalValue);
-    if (value.length) {
-        cacheVisitorData(value);
-        return originalValue;
-    }
-
-    NSString *fallback = currentVisitorData();
-    if (!fallback.length) {
-        fallback = invokeStringSelectorNoArgs(self, @selector(incognitoVisitorData));
-    }
-    if (fallback.length) {
-        invokeVoidSelectorStringArg(self, @selector(setVisitorData:), fallback);
-        return fallback;
-    }
-
-    bootstrapVisitorDataFromWebIfNeeded();
-    return originalValue;
-}
-
-- (void)setVisitorData:(NSString *)visitorData {
-    cacheVisitorData(visitorData);
-    %orig;
-}
-
-- (NSString *)incognitoVisitorData {
-    NSString *originalValue = %orig;
-    NSString *value = trimmedString(originalValue);
-    if (value.length) {
-        cacheVisitorData(value);
-        return originalValue;
-    }
-
-    NSString *fallback = currentVisitorData();
-    if (fallback.length) {
-        invokeVoidSelectorStringArg(self, @selector(setIncognitoVisitorData:), fallback);
-        return fallback;
-    }
-
-    return originalValue;
-}
-
-- (void)setIncognitoVisitorData:(NSString *)visitorData {
-    cacheVisitorData(visitorData);
-    %orig;
-}
-
-- (_Bool)isVisitorDataBugFixed {
-    return YES;
-}
-
-- (void)setIsVisitorDataBugFixed:(_Bool)fixed {
-    %orig(YES);
-}
-%end
-
-%hook YTSignedOutIdentityProvider
-- (NSString *)visitorData {
-    NSString *originalValue = %orig;
-    NSString *value = trimmedString(originalValue);
-    if (value.length) {
-        cacheVisitorData(value);
-        return originalValue;
-    }
-
-    NSString *fallback = currentVisitorData();
-    if (fallback.length) {
-        invokeVoidSelectorStringArg(self, @selector(setVisitorData:), fallback);
-        return fallback;
-    }
-
-    bootstrapVisitorDataFromWebIfNeeded();
-    return originalValue;
-}
-
-- (void)setVisitorData:(NSString *)visitorData {
-    cacheVisitorData(visitorData);
-    %orig;
-}
-%end
-
-%hook YTInnerTubeRequest
-- (NSString *)visitorData {
-    NSString *originalValue = %orig;
-    NSString *value = trimmedString(originalValue);
-    if (value.length) {
-        cacheVisitorData(value);
-        return originalValue;
-    }
-
-    NSString *fallback = currentVisitorData();
-    if (fallback.length) {
-        return fallback;
-    }
-
-    bootstrapVisitorDataFromWebIfNeeded();
-    return originalValue;
-}
-%end
-
-%hook YTInnerTubeRequestFactory
-- (id)requestForProtoRequest:(id)protoRequest withService:(long long)service identityID:(id)identityID visitorData:(id)visitorData needsClickTrackingParams:(_Bool)needsClickTrackingParams clickTrackingParamsOverride:(id)clickTrackingParamsOverride sendDeviceIdentifier:(_Bool)sendDeviceIdentifier skipCacheLookup:(_Bool)skipCacheLookup {
-    NSString *resolvedVisitorData = trimmedString(visitorData);
-    if (!resolvedVisitorData.length) {
-        resolvedVisitorData = currentVisitorData();
-    }
-    if (resolvedVisitorData.length) {
-        cacheVisitorData(resolvedVisitorData);
-        return %orig(protoRequest, service, identityID, resolvedVisitorData, needsClickTrackingParams, clickTrackingParamsOverride, sendDeviceIdentifier, skipCacheLookup);
-    }
-    bootstrapVisitorDataFromWebIfNeeded();
-    return %orig;
 }
 %end
 %end
