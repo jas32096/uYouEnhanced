@@ -662,7 +662,7 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
 %end
 %end
 
-static NSTimer *autoRetryPlaybackTimer = nil;
+static NSUInteger autoRetryPlaybackGeneration = 0;
 static NSMutableArray<NSString *> *playbackDiagnosticTrail = nil;
 static BOOL playbackDiagnosticDidLogConfig = NO;
 
@@ -699,6 +699,172 @@ static NSString *playbackDiagnosticConfigurationCode() {
             swVP9orAV1Enabled ? 1 : 0];
 }
 
+static BOOL invokeVoidSelectorNoArgs(id target, SEL selector) {
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return NO;
+    }
+    void (*invoker)(id, SEL) = (void (*)(id, SEL))[target methodForSelector:selector];
+    if (!invoker) {
+        return NO;
+    }
+    invoker(target, selector);
+    return YES;
+}
+
+static BOOL invokeVoidSelectorBoolArg(id target, SEL selector, BOOL value) {
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return NO;
+    }
+    void (*invoker)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))[target methodForSelector:selector];
+    if (!invoker) {
+        return NO;
+    }
+    invoker(target, selector, value);
+    return YES;
+}
+
+static BOOL markVisitedObject(NSMutableSet<NSValue *> *visited, id object) {
+    if (!object) {
+        return NO;
+    }
+    NSValue *key = [NSValue valueWithNonretainedObject:object];
+    if ([visited containsObject:key]) {
+        return NO;
+    }
+    [visited addObject:key];
+    return YES;
+}
+
+static UIViewController *topViewControllerForAutoRetry() {
+    UIViewController *topViewController = invokeClassSelectorNoArgs(%c(YTUIUtils), NSSelectorFromString(@"topViewControllerForPresenting"));
+    if (!topViewController) {
+        UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+        if (!keyWindow && UIApplication.sharedApplication.windows.count > 0) {
+            keyWindow = UIApplication.sharedApplication.windows.firstObject;
+        }
+        topViewController = keyWindow.rootViewController;
+    }
+    UIViewController *presented = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"presentedViewController"));
+    while (presented) {
+        topViewController = presented;
+        presented = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"presentedViewController"));
+    }
+    return topViewController;
+}
+
+static id resolveResponderFromPlayerViewController(id playerViewController, NSString **sourceCode) {
+    if (!playerViewController) {
+        return nil;
+    }
+
+    SEL parentResponderSelector = NSSelectorFromString(@"parentResponder");
+    SEL delegateSelector = NSSelectorFromString(@"delegate");
+
+    id overlayController = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"activeVideoPlayerOverlay"));
+    id overlayResponder = invokeObjectSelectorNoArgs(overlayController, parentResponderSelector);
+    if (overlayResponder) {
+        if (sourceCode) {
+            *sourceCode = @"RSRC:OVERLAY";
+        }
+        return overlayResponder;
+    }
+
+    id playerResponder = invokeObjectSelectorNoArgs(playerViewController, parentResponderSelector);
+    if (playerResponder) {
+        if (sourceCode) {
+            *sourceCode = @"RSRC:PLAYERVC";
+        }
+        return playerResponder;
+    }
+
+    id uiDelegate = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"UIDelegate"));
+    id uiDelegateResponder = invokeObjectSelectorNoArgs(uiDelegate, parentResponderSelector);
+    if (uiDelegateResponder) {
+        if (sourceCode) {
+            *sourceCode = @"RSRC:UIDEL";
+        }
+        return uiDelegateResponder;
+    }
+
+    id activeVideo = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"activeVideo"));
+    id localPlaybackController = invokeObjectSelectorNoArgs(activeVideo, delegateSelector);
+    id localPlaybackResponder = invokeObjectSelectorNoArgs(localPlaybackController, parentResponderSelector);
+    if (localPlaybackResponder) {
+        if (sourceCode) {
+            *sourceCode = @"RSRC:ACTIVEVIDEO";
+        }
+        return localPlaybackResponder;
+    }
+
+    return nil;
+}
+
+static id resolveResponderInControllerGraph(id controller, NSMutableSet<NSValue *> *visited, NSString **sourceCode) {
+    if (!controller || !markVisitedObject(visited, controller)) {
+        return nil;
+    }
+
+    SEL parentResponderSelector = NSSelectorFromString(@"parentResponder");
+    id directResponder = invokeObjectSelectorNoArgs(controller, parentResponderSelector);
+    if (directResponder) {
+        if (sourceCode) {
+            *sourceCode = @"RSRC:CTRL";
+        }
+        return directResponder;
+    }
+
+    id fromSelfAsPlayer = resolveResponderFromPlayerViewController(controller, sourceCode);
+    if (fromSelfAsPlayer) {
+        return fromSelfAsPlayer;
+    }
+
+    id playerViewController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"playerViewController"));
+    id fromPlayerViewController = resolveResponderFromPlayerViewController(playerViewController, sourceCode);
+    if (fromPlayerViewController) {
+        return fromPlayerViewController;
+    }
+
+    NSArray *navigationStack = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"viewControllers"));
+    if ([navigationStack isKindOfClass:[NSArray class]]) {
+        for (id childController in navigationStack) {
+            id responder = resolveResponderInControllerGraph(childController, visited, sourceCode);
+            if (responder) {
+                return responder;
+            }
+        }
+    }
+
+    id visibleController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"visibleViewController"));
+    id responderFromVisible = resolveResponderInControllerGraph(visibleController, visited, sourceCode);
+    if (responderFromVisible) {
+        return responderFromVisible;
+    }
+
+    id selectedController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"selectedViewController"));
+    id responderFromSelected = resolveResponderInControllerGraph(selectedController, visited, sourceCode);
+    if (responderFromSelected) {
+        return responderFromSelected;
+    }
+
+    id presentedController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"presentedViewController"));
+    id responderFromPresented = resolveResponderInControllerGraph(presentedController, visited, sourceCode);
+    if (responderFromPresented) {
+        return responderFromPresented;
+    }
+
+    NSArray *childControllers = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"childViewControllers"));
+    if ([childControllers isKindOfClass:[NSArray class]]) {
+        for (id childController in childControllers) {
+            id responder = resolveResponderInControllerGraph(childController, visited, sourceCode);
+            if (responder) {
+                return responder;
+            }
+        }
+    }
+
+    return nil;
+}
+
 static id resolveAutoRetryParentResponder(id queuePlayer, NSString **sourceCode) {
     SEL delegateSelector = NSSelectorFromString(@"delegate");
     SEL parentResponderSelector = NSSelectorFromString(@"parentResponder");
@@ -723,52 +889,131 @@ static id resolveAutoRetryParentResponder(id queuePlayer, NSString **sourceCode)
         }
     }
 
-    id topViewController = invokeClassSelectorNoArgs(%c(YTUIUtils), NSSelectorFromString(@"topViewControllerForPresenting"));
-    if (!topViewController) {
-        UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
-        if (!keyWindow && UIApplication.sharedApplication.windows.count > 0) {
-            keyWindow = UIApplication.sharedApplication.windows.firstObject;
-        }
-        topViewController = keyWindow.rootViewController;
-    }
-
-    id presentedViewController = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"presentedViewController"));
-    while (presentedViewController) {
-        topViewController = presentedViewController;
-        presentedViewController = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"presentedViewController"));
-    }
-
-    id topResponder = invokeObjectSelectorNoArgs(topViewController, parentResponderSelector);
-    if (topResponder) {
-        if (sourceCode) {
-            *sourceCode = @"RSRC:TOPVC";
-        }
-        return topResponder;
-    }
-
-    id playerViewController = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"playerViewController"));
-    id playerResponder = invokeObjectSelectorNoArgs(playerViewController, parentResponderSelector);
-    if (playerResponder) {
-        if (sourceCode) {
-            *sourceCode = @"RSRC:PLAYERVC";
-        }
-        return playerResponder;
-    }
-
-    id activeVideo = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"activeVideo"));
-    id localPlaybackController = invokeObjectSelectorNoArgs(activeVideo, delegateSelector);
-    id activeVideoResponder = invokeObjectSelectorNoArgs(localPlaybackController, parentResponderSelector);
-    if (activeVideoResponder) {
-        if (sourceCode) {
-            *sourceCode = @"RSRC:ACTIVEVIDEO";
-        }
-        return activeVideoResponder;
+    UIViewController *topViewController = topViewControllerForAutoRetry();
+    NSMutableSet<NSValue *> *visited = [NSMutableSet set];
+    id resolvedResponder = resolveResponderInControllerGraph(topViewController, visited, sourceCode);
+    if (resolvedResponder) {
+        return resolvedResponder;
     }
 
     if (sourceCode) {
         *sourceCode = @"MISS:NONE";
     }
     return nil;
+}
+
+static BOOL performFallbackActionFromPlayerViewController(id playerViewController, NSString **actionCode) {
+    if (!playerViewController) {
+        return NO;
+    }
+
+    if (invokeVoidSelectorNoArgs(playerViewController, NSSelectorFromString(@"replay"))) {
+        if (actionCode) {
+            *actionCode = @"ACT:PVC_REPLAY";
+        }
+        return YES;
+    }
+
+    id activeVideo = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"activeVideo"));
+    id localPlaybackController = invokeObjectSelectorNoArgs(activeVideo, NSSelectorFromString(@"delegate"));
+    if (invokeVoidSelectorNoArgs(localPlaybackController, NSSelectorFromString(@"replay"))) {
+        if (actionCode) {
+            *actionCode = @"ACT:LPC_REPLAY";
+        }
+        return YES;
+    }
+
+    id uiDelegate = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"UIDelegate"));
+    if (invokeVoidSelectorBoolArg(uiDelegate, NSSelectorFromString(@"reloadStartPlayback:"), YES)) {
+        if (actionCode) {
+            *actionCode = @"ACT:UIDEL_RELOAD";
+        }
+        return YES;
+    }
+
+    return NO;
+}
+
+static BOOL performFallbackActionInControllerGraph(id controller, NSMutableSet<NSValue *> *visited, NSString **actionCode) {
+    if (!controller || !markVisitedObject(visited, controller)) {
+        return NO;
+    }
+
+    if (performFallbackActionFromPlayerViewController(controller, actionCode)) {
+        return YES;
+    }
+
+    id playerViewController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"playerViewController"));
+    if (performFallbackActionFromPlayerViewController(playerViewController, actionCode)) {
+        return YES;
+    }
+
+    NSArray *navigationStack = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"viewControllers"));
+    if ([navigationStack isKindOfClass:[NSArray class]]) {
+        for (id childController in navigationStack) {
+            if (performFallbackActionInControllerGraph(childController, visited, actionCode)) {
+                return YES;
+            }
+        }
+    }
+
+    id visibleController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"visibleViewController"));
+    if (performFallbackActionInControllerGraph(visibleController, visited, actionCode)) {
+        return YES;
+    }
+
+    id selectedController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"selectedViewController"));
+    if (performFallbackActionInControllerGraph(selectedController, visited, actionCode)) {
+        return YES;
+    }
+
+    id presentedController = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"presentedViewController"));
+    if (performFallbackActionInControllerGraph(presentedController, visited, actionCode)) {
+        return YES;
+    }
+
+    NSArray *childControllers = invokeObjectSelectorNoArgs(controller, NSSelectorFromString(@"childViewControllers"));
+    if ([childControllers isKindOfClass:[NSArray class]]) {
+        for (id childController in childControllers) {
+            if (performFallbackActionInControllerGraph(childController, visited, actionCode)) {
+                return YES;
+            }
+        }
+    }
+
+    return NO;
+}
+
+static BOOL performAutoRetryFallbackAction(id queuePlayer, NSString **actionCode) {
+    id queueDelegate = invokeObjectSelectorNoArgs(queuePlayer, NSSelectorFromString(@"delegate"));
+    if (invokeVoidSelectorNoArgs(queueDelegate, NSSelectorFromString(@"replay"))) {
+        if (actionCode) {
+            *actionCode = @"ACT:QD_REPLAY";
+        }
+        return YES;
+    }
+
+    id playbackController = invokeObjectSelectorNoArgs(queueDelegate, NSSelectorFromString(@"delegate"));
+    if (invokeVoidSelectorNoArgs(playbackController, NSSelectorFromString(@"replay"))) {
+        if (actionCode) {
+            *actionCode = @"ACT:PLAYCTRL_REPLAY";
+        }
+        return YES;
+    }
+    if (invokeVoidSelectorBoolArg(playbackController, NSSelectorFromString(@"reloadStartPlayback:"), YES)) {
+        if (actionCode) {
+            *actionCode = @"ACT:PLAYCTRL_RELOAD";
+        }
+        return YES;
+    }
+
+    UIViewController *topViewController = topViewControllerForAutoRetry();
+    NSMutableSet<NSValue *> *visited = [NSMutableSet set];
+    BOOL performed = performFallbackActionInControllerGraph(topViewController, visited, actionCode);
+    if (!performed && actionCode) {
+        *actionCode = @"ACT:NONE";
+    }
+    return performed;
 }
 
 static void ensurePlaybackDiagnosticTrail() {
@@ -819,7 +1064,7 @@ static void markPlaybackDiagnostic(NSString *eventCode) {
     }
     @synchronized (playbackDiagnosticTrail) {
         [playbackDiagnosticTrail addObject:eventCode];
-        if (playbackDiagnosticTrail.count > 5) {
+        if (playbackDiagnosticTrail.count > 8) {
             [playbackDiagnosticTrail removeObjectAtIndex:0];
         }
         NSString *text = [NSString stringWithFormat:@"Diag %@", [playbackDiagnosticTrail componentsJoinedByString:@" > "]];
@@ -829,10 +1074,7 @@ static void markPlaybackDiagnostic(NSString *eventCode) {
 }
 
 static void invalidateAutoRetryPlaybackTimer() {
-    if (autoRetryPlaybackTimer) {
-        [autoRetryPlaybackTimer invalidate];
-        autoRetryPlaybackTimer = nil;
-    }
+    autoRetryPlaybackGeneration += 1;
 }
 
 %group gAutoRetryPlayback
@@ -858,11 +1100,12 @@ static void invalidateAutoRetryPlaybackTimer() {
         markPlaybackDiagnostic(@"AUTO:ARM");
         invalidateAutoRetryPlaybackTimer();
         __weak typeof(self) weakSelf = self;
-        autoRetryPlaybackTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
-                                                                  repeats:NO
-                                                                    block:^(NSTimer *timer) {
-            autoRetryPlaybackTimer = nil;
-            markPlaybackDiagnostic(@"AUTO:FIRE");
+        NSUInteger scheduledGeneration = autoRetryPlaybackGeneration;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (scheduledGeneration != autoRetryPlaybackGeneration) {
+                return;
+            }
+            markPlaybackDiagnostic(@"AUTO:FIRE_MAIN");
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) {
                 markPlaybackDiagnostic(@"AUTO:ABORT_NO_PLAYER");
@@ -875,7 +1118,16 @@ static void invalidateAutoRetryPlaybackTimer() {
                 markPlaybackDiagnostic(responderSourceCode);
             }
             if (!parentResponder) {
-                markPlaybackDiagnostic(@"AUTO:ABORT_NO_RESPONDER");
+                NSString *actionCode = nil;
+                BOOL performedFallbackAction = performAutoRetryFallbackAction(strongSelf, &actionCode);
+                if (actionCode.length) {
+                    markPlaybackDiagnostic(actionCode);
+                }
+                if (performedFallbackAction) {
+                    markPlaybackDiagnostic(@"AUTO:FALLBACK_OK");
+                } else {
+                    markPlaybackDiagnostic(@"AUTO:ABORT_NO_RESPONDER");
+                }
                 return;
             }
 
@@ -898,14 +1150,14 @@ static void invalidateAutoRetryPlaybackTimer() {
                 void (*sendInvoker)(id, SEL) = (void (*)(id, SEL))[retryEvent methodForSelector:sendSelector];
                 if (sendInvoker) {
                     sendInvoker(retryEvent, sendSelector);
-                    markPlaybackDiagnostic(@"AUTO:RETRY_SENT");
+                    markPlaybackDiagnostic(@"AUTO:EVENT_SENT");
                 } else {
                     markPlaybackDiagnostic(@"AUTO:ABORT_NO_SENDINVOKER");
                 }
             } else {
                 markPlaybackDiagnostic(@"AUTO:ABORT_NO_SENDSELECTOR");
             }
-        }];
+        });
     } else {
         invalidateAutoRetryPlaybackTimer();
     }
