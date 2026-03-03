@@ -1903,10 +1903,16 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
     %init;
 
     NSUserDefaults *userDefaults = [NSUserDefaults standardUserDefaults];
+    [userDefaults setBool:NO forKey:kAdBlockWorkaroundLite];
+    [userDefaults setBool:NO forKey:kAdBlockWorkaround];
+    [userDefaults setBool:NO forKey:kAutoRetryPlayback];
+    [userDefaults setBool:NO forKey:kEnableVersionSpoofer];
+    [userDefaults setBool:NO forKey:@"removeYouTubeAds"];
+    [userDefaults setBool:NO forKey:@"EnableSWVP9orSWAV1"];
+    [userDefaults setBool:NO forKey:@"AllVP9"];
+    [userDefaults setBool:NO forKey:@"ReloadVideos"];
+    [userDefaults setBool:NO forKey:@"RYD-ENABLED"];
     if (![userDefaults boolForKey:@"playbackRootCauseHotfixApplied"]) {
-        [userDefaults setBool:NO forKey:kAdBlockWorkaroundLite];
-        [userDefaults setBool:NO forKey:kAdBlockWorkaround];
-        [userDefaults setBool:NO forKey:kAutoRetryPlayback];
         [userDefaults setBool:YES forKey:@"playbackRootCauseHotfixApplied"];
     }
 /*

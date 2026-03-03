@@ -34,25 +34,7 @@ $(TWEAK_NAME)_FRAMEWORKS = UIKit Foundation AVFoundation AVKit Photos Accelerate
 $(TWEAK_NAME)_LIBRARIES = bz2 c++ iconv z
 $(TWEAK_NAME)_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-but-set-variable -DTWEAK_VERSION=\"$(PACKAGE_VERSION)\"
 $(TWEAK_NAME)_INJECT_DYLIBS = \
-    Tweaks/uYou/Library/MobileSubstrate/DynamicLibraries/uYou.dylib \
-    $(THEOS_OBJ_DIR)/libFLEX.dylib \
-    $(THEOS_OBJ_DIR)/iSponsorBlock.dylib \
-    $(THEOS_OBJ_DIR)/YTABConfig.dylib \
-    $(THEOS_OBJ_DIR)/YTIcons.dylib \
-    $(THEOS_OBJ_DIR)/YouGroupSettings.dylib \
-    $(THEOS_OBJ_DIR)/YouLoop.dylib \
-    $(THEOS_OBJ_DIR)/YouMute.dylib \
-    $(THEOS_OBJ_DIR)/YouPiP.dylib \
-    $(THEOS_OBJ_DIR)/YouQuality.dylib \
-    $(THEOS_OBJ_DIR)/YouSlider.dylib \
-    $(THEOS_OBJ_DIR)/YouSpeed.dylib \
-    $(THEOS_OBJ_DIR)/YouTimeStamp.dylib \
-    $(THEOS_OBJ_DIR)/YouTubeDislikesReturn.dylib \
-    $(THEOS_OBJ_DIR)/DontEatMyContent.dylib \
-    $(THEOS_OBJ_DIR)/YTHoldForSpeed.dylib \
-    $(THEOS_OBJ_DIR)/YTUHD.dylib \
-    $(THEOS_OBJ_DIR)/YTVideoOverlay.dylib \
-    $(THEOS_OBJ_DIR)/YTweaks.dylib
+    Tweaks/uYou/Library/MobileSubstrate/DynamicLibraries/uYou.dylib
 
 $(TWEAK_NAME)_EMBED_LIBRARIES = $(THEOS_OBJ_DIR)/libcolorpicker.dylib
 $(TWEAK_NAME)_EMBED_FRAMEWORKS = $(_THEOS_LOCAL_DATA_DIR)/$(THEOS_OBJ_DIR_NAME)/install_Alderis.xcarchive/Products/var/jb/Library/Frameworks/Alderis.framework
