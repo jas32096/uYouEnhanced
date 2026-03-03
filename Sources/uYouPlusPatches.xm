@@ -879,7 +879,6 @@ static void refreshUYouAppearance() {
     }
 
     bootstrapVisitorDataFromWebIfNeeded();
-    %init(gGoogleSignInPatch);
     %init(gVisitorDataFix);
 
     if (kPlaybackIsolationStage == 1) {
