@@ -3,6 +3,7 @@
 #define YT_BUNDLE_ID @"com.google.ios.youtube"
 #define YT_NAME @"YouTube"
 static NSInteger const kPlaybackIsolationStage = 1;
+static BOOL const kEnableGoogleSignInBundlePatch = NO;
 
 # pragma mark - YouTube patches
 
@@ -10,14 +11,23 @@ static NSInteger const kPlaybackIsolationStage = 1;
 %group gGoogleSignInPatch
 %hook NSBundle
 + (NSBundle *)bundleWithIdentifier:(NSString *)identifier {
+    if (!kEnableGoogleSignInBundlePatch) {
+        return %orig(identifier);
+    }
     if ([identifier isEqualToString:YT_BUNDLE_ID])
         return NSBundle.mainBundle;
     return %orig(identifier);
 }
 - (NSString *)bundleIdentifier {
+    if (!kEnableGoogleSignInBundlePatch) {
+        return %orig;
+    }
     return [self isEqual:NSBundle.mainBundle] ? YT_BUNDLE_ID : %orig;
 }
 - (NSDictionary *)infoDictionary {
+    if (!kEnableGoogleSignInBundlePatch) {
+        return %orig;
+    }
     NSDictionary *dict = %orig;
     if (![self isEqual:NSBundle.mainBundle])
         return %orig;
@@ -28,6 +38,9 @@ static NSInteger const kPlaybackIsolationStage = 1;
     return info;
 }
 - (id)objectForInfoDictionaryKey:(NSString *)key {
+    if (!kEnableGoogleSignInBundlePatch) {
+        return %orig;
+    }
     if (![self isEqual:NSBundle.mainBundle])
         return %orig;
     if ([key isEqualToString:@"CFBundleIdentifier"])
@@ -879,6 +892,7 @@ static void refreshUYouAppearance() {
     }
 
     bootstrapVisitorDataFromWebIfNeeded();
+    %init(gGoogleSignInPatch);
     %init(gVisitorDataFix);
 
     if (kPlaybackIsolationStage == 1) {
