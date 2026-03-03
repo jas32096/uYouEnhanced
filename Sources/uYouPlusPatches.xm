@@ -2,7 +2,7 @@
 
 #define YT_BUNDLE_ID @"com.google.ios.youtube"
 #define YT_NAME @"YouTube"
-static NSInteger const kPlaybackIsolationStage = 3;
+static NSInteger const kPlaybackIsolationStage = 0;
 
 # pragma mark - YouTube patches
 
@@ -648,13 +648,16 @@ static void refreshUYouAppearance() {
     if (kPlaybackIsolationStage == 0) {
         return;
     }
-    if (kPlaybackIsolationStage == 1) {
-        %init(gGoogleSignInPatch);
-        return;
+
+    if (kPlaybackIsolationStage >= 2) {
+        %init;
     }
 
-    %init;
     %init(gGoogleSignInPatch);
+
+    if (kPlaybackIsolationStage == 1) {
+        return;
+    }
 /*
     if (IS_ENABLED(kYouTubeNativeShare)) {
         %init(gYouTubeNativeShare);
