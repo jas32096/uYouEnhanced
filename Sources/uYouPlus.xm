@@ -664,6 +664,112 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
 
 static NSTimer *autoRetryPlaybackTimer = nil;
 static NSMutableArray<NSString *> *playbackDiagnosticTrail = nil;
+static BOOL playbackDiagnosticDidLogConfig = NO;
+
+static id invokeObjectSelectorNoArgs(id target, SEL selector) {
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return nil;
+    }
+    id (*invoker)(id, SEL) = (id (*)(id, SEL))[target methodForSelector:selector];
+    return invoker ? invoker(target, selector) : nil;
+}
+
+static id invokeClassSelectorNoArgs(Class targetClass, SEL selector) {
+    if (!targetClass || !selector || ![targetClass respondsToSelector:selector]) {
+        return nil;
+    }
+    id (*invoker)(id, SEL) = (id (*)(id, SEL))[targetClass methodForSelector:selector];
+    return invoker ? invoker(targetClass, selector) : nil;
+}
+
+static NSString *playbackDiagnosticConfigurationCode() {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL adblockWorkaroundEnabled = [defaults boolForKey:kAdBlockWorkaround];
+    BOOL adblockWorkaroundLiteEnabled = [defaults boolForKey:kAdBlockWorkaroundLite];
+    BOOL versionSpooferEnabled = [defaults boolForKey:kEnableVersionSpoofer];
+    NSInteger spoofedVersionIndex = [defaults integerForKey:@"versionSpoofer"];
+    BOOL reloadVideosEnabled = [defaults boolForKey:@"ReloadVideos"];
+    BOOL swVP9orAV1Enabled = [defaults boolForKey:@"EnableSWVP9orSWAV1"];
+    return [NSString stringWithFormat:@"CFG:A%dL%dV%dI%ldR%dU%d",
+            adblockWorkaroundEnabled ? 1 : 0,
+            adblockWorkaroundLiteEnabled ? 1 : 0,
+            versionSpooferEnabled ? 1 : 0,
+            (long)spoofedVersionIndex,
+            reloadVideosEnabled ? 1 : 0,
+            swVP9orAV1Enabled ? 1 : 0];
+}
+
+static id resolveAutoRetryParentResponder(id queuePlayer, NSString **sourceCode) {
+    SEL delegateSelector = NSSelectorFromString(@"delegate");
+    SEL parentResponderSelector = NSSelectorFromString(@"parentResponder");
+
+    id queueDelegate = invokeObjectSelectorNoArgs(queuePlayer, delegateSelector);
+    if (queueDelegate) {
+        id playbackController = invokeObjectSelectorNoArgs(queueDelegate, delegateSelector);
+        id chainResponder = invokeObjectSelectorNoArgs(playbackController, parentResponderSelector);
+        if (chainResponder) {
+            if (sourceCode) {
+                *sourceCode = @"RSRC:QD_CHAIN";
+            }
+            return chainResponder;
+        }
+
+        id directQueueDelegateResponder = invokeObjectSelectorNoArgs(queueDelegate, parentResponderSelector);
+        if (directQueueDelegateResponder) {
+            if (sourceCode) {
+                *sourceCode = @"RSRC:QD_DIRECT";
+            }
+            return directQueueDelegateResponder;
+        }
+    }
+
+    id topViewController = invokeClassSelectorNoArgs(%c(YTUIUtils), NSSelectorFromString(@"topViewControllerForPresenting"));
+    if (!topViewController) {
+        UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+        if (!keyWindow && UIApplication.sharedApplication.windows.count > 0) {
+            keyWindow = UIApplication.sharedApplication.windows.firstObject;
+        }
+        topViewController = keyWindow.rootViewController;
+    }
+
+    id presentedViewController = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"presentedViewController"));
+    while (presentedViewController) {
+        topViewController = presentedViewController;
+        presentedViewController = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"presentedViewController"));
+    }
+
+    id topResponder = invokeObjectSelectorNoArgs(topViewController, parentResponderSelector);
+    if (topResponder) {
+        if (sourceCode) {
+            *sourceCode = @"RSRC:TOPVC";
+        }
+        return topResponder;
+    }
+
+    id playerViewController = invokeObjectSelectorNoArgs(topViewController, NSSelectorFromString(@"playerViewController"));
+    id playerResponder = invokeObjectSelectorNoArgs(playerViewController, parentResponderSelector);
+    if (playerResponder) {
+        if (sourceCode) {
+            *sourceCode = @"RSRC:PLAYERVC";
+        }
+        return playerResponder;
+    }
+
+    id activeVideo = invokeObjectSelectorNoArgs(playerViewController, NSSelectorFromString(@"activeVideo"));
+    id localPlaybackController = invokeObjectSelectorNoArgs(activeVideo, delegateSelector);
+    id activeVideoResponder = invokeObjectSelectorNoArgs(localPlaybackController, parentResponderSelector);
+    if (activeVideoResponder) {
+        if (sourceCode) {
+            *sourceCode = @"RSRC:ACTIVEVIDEO";
+        }
+        return activeVideoResponder;
+    }
+
+    if (sourceCode) {
+        *sourceCode = @"MISS:NONE";
+    }
+    return nil;
+}
 
 static void ensurePlaybackDiagnosticTrail() {
     static dispatch_once_t onceToken;
@@ -735,6 +841,11 @@ static void invalidateAutoRetryPlaybackTimer() {
 - (void)setState:(NSInteger)state {
     %orig;
 
+    if (!playbackDiagnosticDidLogConfig) {
+        playbackDiagnosticDidLogConfig = YES;
+        markPlaybackDiagnostic(playbackDiagnosticConfigurationCode());
+    }
+
     markPlaybackDiagnostic([NSString stringWithFormat:@"S%ld", (long)state]);
 
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"ReloadVideos"]) {
@@ -751,25 +862,18 @@ static void invalidateAutoRetryPlaybackTimer() {
                                                                   repeats:NO
                                                                     block:^(NSTimer *timer) {
             autoRetryPlaybackTimer = nil;
+            markPlaybackDiagnostic(@"AUTO:FIRE");
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) {
                 markPlaybackDiagnostic(@"AUTO:ABORT_NO_PLAYER");
                 return;
             }
 
-            id queueDelegate = strongSelf.delegate;
-            if (!queueDelegate || ![queueDelegate respondsToSelector:@selector(delegate)]) {
-                markPlaybackDiagnostic(@"AUTO:ABORT_NO_QDELEGATE");
-                return;
+            NSString *responderSourceCode = nil;
+            id parentResponder = resolveAutoRetryParentResponder(strongSelf, &responderSourceCode);
+            if (responderSourceCode.length) {
+                markPlaybackDiagnostic(responderSourceCode);
             }
-
-            id playbackController = [queueDelegate delegate];
-            if (!playbackController || ![playbackController respondsToSelector:@selector(parentResponder)]) {
-                markPlaybackDiagnostic(@"AUTO:ABORT_NO_PLAYCTRL");
-                return;
-            }
-
-            id parentResponder = [playbackController parentResponder];
             if (!parentResponder) {
                 markPlaybackDiagnostic(@"AUTO:ABORT_NO_RESPONDER");
                 return;

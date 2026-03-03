@@ -41,15 +41,15 @@
 // Workaround for MiRO92/uYou-for-YouTube#12, qnblackcat/uYouPlus#263
 %hook YTDataUtils
 + (NSMutableDictionary *)spamSignalsDictionary {
-    return nil;
+    return %orig;
 }
 + (NSMutableDictionary *)spamSignalsDictionaryWithoutIDFA {
-    return nil;
+    return %orig;
 }
 %end
 
 %hook YTHotConfig
-- (BOOL)disableAfmaIdfaCollection { return NO; }
+- (BOOL)disableAfmaIdfaCollection { return %orig; }
 %end
 
 // Reposition "Create" Tab to the Center in the Pivot Bar - qnblackcat/uYouPlus#107
