@@ -173,6 +173,21 @@ static BOOL isInnerTubePlaybackLifecycleRequest(NSURL *url) {
             [absoluteString containsString:@"youtubei/v1/reel/reel_watch_sequence"]);
 }
 
+static BOOL isGoogleVideoPlaybackRequest(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) {
+        return NO;
+    }
+    NSString *host = url.host.lowercaseString;
+    if (![host isKindOfClass:[NSString class]]) {
+        return NO;
+    }
+    if (![host containsString:@"googlevideo.com"]) {
+        return NO;
+    }
+    NSString *path = url.path.lowercaseString;
+    return [path containsString:@"videoplayback"];
+}
+
 static BOOL headerLooksLoggedIn(NSDictionary *headers) {
     NSString *loggedInHeader = headerValueForKey(headers, @"X-Goog-Logged-In");
     if ([loggedInHeader isEqualToString:@"1"]) {
@@ -184,6 +199,31 @@ static BOOL headerLooksLoggedIn(NSDictionary *headers) {
         return YES;
     }
     return NO;
+}
+
+static BOOL shouldStripSignedInHeadersForURL(NSURL *url) {
+    return isInnerTubePlaybackLifecycleRequest(url) || isGoogleVideoPlaybackRequest(url);
+}
+
+static BOOL isBlockedSignedInHeaderField(NSString *field) {
+    if (![field isKindOfClass:[NSString class]]) {
+        return NO;
+    }
+    NSString *lowerField = field.lowercaseString;
+    return [lowerField isEqualToString:@"authorization"] ||
+           [lowerField isEqualToString:@"cookie"] ||
+           [lowerField isEqualToString:@"x-goog-authuser"] ||
+           [lowerField isEqualToString:@"x-goog-pageid"] ||
+           [lowerField isEqualToString:@"x-goog-device-auth"];
+}
+
+static BOOL isLoggedInStateHeaderField(NSString *field) {
+    if (![field isKindOfClass:[NSString class]]) {
+        return NO;
+    }
+    NSString *lowerField = field.lowercaseString;
+    return [lowerField isEqualToString:@"x-goog-logged-in"] ||
+           [lowerField isEqualToString:@"x-youtube-bootstrap-logged-in"];
 }
 
 static NSString *extractVisitorDataFromURL(NSURL *url) {
@@ -303,7 +343,15 @@ static void bootstrapVisitorDataFromWebIfNeeded(void) {
 }
 
 static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request) {
-    if (![request isKindOfClass:[NSURLRequest class]] || !isInnerTubeRequest(request.URL)) {
+    if (![request isKindOfClass:[NSURLRequest class]]) {
+        return request;
+    }
+
+    NSURL *requestURL = request.URL;
+    BOOL isInnerTube = isInnerTubeRequest(requestURL);
+    BOOL shouldNormalizePlaybackIdentity = shouldStripSignedInHeadersForURL(requestURL);
+
+    if (!isInnerTube && !shouldNormalizePlaybackIdentity) {
         return request;
     }
 
@@ -319,32 +367,39 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
                              [cookieHeader rangeOfString:@"SID=" options:NSCaseInsensitiveSearch].location != NSNotFound ||
                              [cookieHeader rangeOfString:@"HSID=" options:NSCaseInsensitiveSearch].location != NSNotFound);
     }
-    BOOL shouldStripSignedInHeadersForPlayback = isInnerTubePlaybackLifecycleRequest(request.URL) &&
+    BOOL shouldStripSignedInHeadersForPlayback = shouldNormalizePlaybackIdentity &&
         (authorizationHeader.length > 0 || authUserHeader.length > 0 || hasSignedInCookie || headerLooksLoggedIn(headers));
 
+    NSString *visitorData = nil;
     NSString *visitorDataFromHeaders = headerValueForKey(headers, @"X-Goog-Visitor-Id");
     if (visitorDataFromHeaders.length) {
         cacheVisitorData(visitorDataFromHeaders);
+        visitorData = visitorDataFromHeaders;
     }
 
     NSString *visitorDataFromCookie = extractVisitorDataFromCookies(cookieHeader);
     if (visitorDataFromCookie.length) {
         cacheVisitorData(visitorDataFromCookie);
+        if (!visitorData.length) {
+            visitorData = visitorDataFromCookie;
+        }
     }
 
-    NSString *visitorData = visitorDataFromHeaders.length ? visitorDataFromHeaders : visitorDataFromCookie;
     if (!visitorData.length) {
         visitorData = currentVisitorData();
     }
-    if (!visitorData.length) {
-        visitorData = extractVisitorDataFromURL(request.URL);
-    }
-    if (!visitorData.length) {
-        visitorData = extractVisitorDataFromBody(request.HTTPBody);
+
+    if (isInnerTube) {
+        if (!visitorData.length) {
+            visitorData = extractVisitorDataFromURL(requestURL);
+        }
+        if (!visitorData.length) {
+            visitorData = extractVisitorDataFromBody(request.HTTPBody);
+        }
     }
 
-    BOOL shouldInjectVisitorHeader = visitorData.length > 0;
-    if (!shouldInjectVisitorHeader) {
+    BOOL shouldInjectVisitorHeader = isInnerTube && visitorData.length > 0;
+    if (isInnerTube && !shouldInjectVisitorHeader) {
         bootstrapVisitorDataFromWebIfNeeded();
     }
 
@@ -395,6 +450,18 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
 %group gVisitorDataFix
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    NSURL *requestURL = self.URL;
+
+    if (shouldStripSignedInHeadersForURL(requestURL) && isBlockedSignedInHeaderField(field) && value.length) {
+        %orig(nil, field);
+        return;
+    }
+
+    if (isInnerTubePlaybackLifecycleRequest(requestURL) && isLoggedInStateHeaderField(field)) {
+        %orig(@"0", field);
+        return;
+    }
+
     if ([field isKindOfClass:[NSString class]] && [field caseInsensitiveCompare:@"X-Goog-Visitor-Id"] == NSOrderedSame) {
         cacheVisitorData(value);
     }
@@ -402,8 +469,33 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
 }
 
 - (void)setAllHTTPHeaderFields:(NSDictionary<NSString *, NSString *> *)headerFields {
-    cacheVisitorData(headerValueForKey(headerFields, @"X-Goog-Visitor-Id"));
-    %orig;
+    NSMutableDictionary<NSString *, NSString *> *normalizedHeaders = [headerFields isKindOfClass:[NSDictionary class]] ? [headerFields mutableCopy] : [NSMutableDictionary dictionary];
+
+    NSURL *requestURL = self.URL;
+    if (shouldStripSignedInHeadersForURL(requestURL)) {
+        NSArray<NSString *> *blockedFields = @[@"Authorization", @"Cookie", @"X-Goog-AuthUser", @"X-Goog-PageId", @"X-Goog-Device-Auth"];
+        for (NSString *blockedField in blockedFields) {
+            [normalizedHeaders removeObjectForKey:blockedField];
+            NSString *matchedHeader = nil;
+            for (NSString *existingKey in normalizedHeaders.allKeys) {
+                if ([existingKey caseInsensitiveCompare:blockedField] == NSOrderedSame) {
+                    matchedHeader = existingKey;
+                    break;
+                }
+            }
+            if (matchedHeader) {
+                [normalizedHeaders removeObjectForKey:matchedHeader];
+            }
+        }
+
+        if (isInnerTubePlaybackLifecycleRequest(requestURL)) {
+            normalizedHeaders[@"X-Goog-Logged-In"] = @"0";
+            normalizedHeaders[@"X-Youtube-Bootstrap-Logged-In"] = @"0";
+        }
+    }
+
+    cacheVisitorData(headerValueForKey(normalizedHeaders, @"X-Goog-Visitor-Id"));
+    %orig(normalizedHeaders);
 }
 %end
 
