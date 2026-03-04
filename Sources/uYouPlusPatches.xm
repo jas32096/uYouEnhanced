@@ -991,7 +991,7 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
     }
 }
 
-@interface UYEPlaybackSessionDelegateProxy : NSObject <NSURLSessionDelegate, NSURLSessionTaskDelegate, NSURLSessionDataDelegate, NSURLSessionDownloadDelegate>
+@interface UYEPlaybackSessionDelegateProxy : NSObject <NSURLSessionDelegate, NSURLSessionTaskDelegate, NSURLSessionDataDelegate>
 - (instancetype)initWithDelegate:(id)delegate;
 @end
 
