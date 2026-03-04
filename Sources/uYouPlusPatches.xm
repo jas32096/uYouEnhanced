@@ -675,7 +675,7 @@ static void recordAVPlayerItemDiagnostic(NSString *eventCode, AVPlayerItem *item
             errorStatusCode = lastEvent.errorStatusCode;
             errorLogDomain = shortenedDiagnosticString(lastEvent.errorDomain, 40);
             errorLogComment = shortenedDiagnosticString(lastEvent.errorComment, 80);
-            errorLogURI = shortenedDiagnosticString(lastEvent.uri, 80);
+            errorLogURI = shortenedDiagnosticString(lastEvent.URI, 80);
         }
     }
 
