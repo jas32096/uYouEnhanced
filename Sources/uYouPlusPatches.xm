@@ -74,7 +74,7 @@ static NSString *const kPlaybackDiagLastFailureKey = @"uYouEnhancedPlaybackDiagL
 static NSString *const kPlaybackDiagLastUpdatedKey = @"uYouEnhancedPlaybackDiagLastUpdated";
 static NSString *const kPlaybackDiagFileName = @"uYouEnhancedPlaybackDiagnostics.txt";
 static NSUInteger const kPlaybackDiagMaxLines = 120;
-static NSTimeInterval const kPlaybackDiagAutoCopyThrottleSeconds = 8.0;
+static NSTimeInterval const kPlaybackDiagAutoCopyThrottleSeconds = 4.0;
 static NSMutableArray<NSString *> *playbackDiagLines = nil;
 static NSString *playbackDiagLastAutoCopiedFailure = nil;
 static NSDate *playbackDiagLastAutoCopiedAt = nil;
@@ -82,7 +82,7 @@ static NSDate *playbackDiagLastAutoCopiedAt = nil;
 static NSString *playbackEndpointCodeForURL(NSURL *url);
 static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURLRequest *patchedRequest, BOOL strippedAuthHeaders, BOOL injectedVisitorHeader);
 static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLResponse *response, NSData *data, NSError *error);
-static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *failureCode);
+static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *reasonCode);
 
 static dispatch_queue_t visitorDataQueue() {
     static dispatch_queue_t queue;
@@ -198,12 +198,23 @@ static void appendPlaybackDiagnosticLine(NSString *line, NSString *failureCode, 
         [defaults setObject:playbackDiagLines forKey:kPlaybackDiagLinesKey];
         [defaults setObject:[NSDate date] forKey:kPlaybackDiagLastUpdatedKey];
 
+        NSString *autoCopyReason = failureCode;
+        if (!autoCopyReason.length) {
+            if ([line containsString:@" RES "]) {
+                autoCopyReason = @"RES_EVENT";
+            } else if ([line containsString:@" REQ "]) {
+                autoCopyReason = @"REQ_EVENT";
+            } else {
+                autoCopyReason = @"EVENT";
+            }
+        }
+        autoCopyPlaybackDiagnosticsIfNeeded(autoCopyReason);
+
         if (failureCode.length) {
             [defaults setObject:failureCode forKey:kPlaybackDiagLastFailureKey];
             if (shouldShowBanner) {
                 showPlaybackDiagnosticsBanner([NSString stringWithFormat:@"Playback %@", failureCode]);
             }
-            autoCopyPlaybackDiagnosticsIfNeeded(failureCode);
         }
     });
 }
@@ -254,18 +265,20 @@ NSString *uYouEnhancedPlaybackDiagnosticsWriteReportToFile(void) {
     return writeError ? nil : path;
 }
 
-static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *failureCode) {
-    if (!failureCode.length || !playbackDiagnosticsAutoCopyEnabled()) {
+static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *reasonCode) {
+    if (!playbackDiagnosticsAutoCopyEnabled()) {
         return;
     }
+
+    NSString *normalizedReason = reasonCode.length ? reasonCode : @"EVENT";
 
     NSDate *now = [NSDate date];
-    BOOL isSameFailureCode = [playbackDiagLastAutoCopiedFailure isEqualToString:failureCode];
-    if (isSameFailureCode && playbackDiagLastAutoCopiedAt && [now timeIntervalSinceDate:playbackDiagLastAutoCopiedAt] < kPlaybackDiagAutoCopyThrottleSeconds) {
+    BOOL isSameReasonCode = [playbackDiagLastAutoCopiedFailure isEqualToString:normalizedReason];
+    if (isSameReasonCode && playbackDiagLastAutoCopiedAt && [now timeIntervalSinceDate:playbackDiagLastAutoCopiedAt] < kPlaybackDiagAutoCopyThrottleSeconds) {
         return;
     }
 
-    playbackDiagLastAutoCopiedFailure = [failureCode copy];
+    playbackDiagLastAutoCopiedFailure = [normalizedReason copy];
     playbackDiagLastAutoCopiedAt = now;
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -273,8 +286,9 @@ static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *failureCode) {
         NSString *reportPath = uYouEnhancedPlaybackDiagnosticsWriteReportToFile();
 
         NSMutableString *clipboardPayload = [NSMutableString string];
+        [clipboardPayload appendFormat:@"[uYouEnhanced diag %@ at %@]\n", normalizedReason, playbackDiagTimestamp()];
         if (report.length) {
-            [clipboardPayload appendString:report];
+            [clipboardPayload appendFormat:@"\n%@", report];
         }
         if (reportPath.length) {
             [clipboardPayload appendFormat:@"\n\nDiagnostics file: %@\n", reportPath];
