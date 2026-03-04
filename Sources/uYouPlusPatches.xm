@@ -617,31 +617,73 @@ static BOOL playbackCompatibilityReturnNO(id self, SEL _cmd) {
     return NO;
 }
 
-static BOOL shouldPatchPlaybackCompatibilitySelector(NSString *selectorName) {
+static BOOL playbackCompatibilityReturnYES(id self, SEL _cmd) {
+    return YES;
+}
+
+static NSNumber *desiredCompatibilityBoolValueForSelector(NSString *selectorName) {
     NSString *lowercaseSelector = trimmedString(selectorName).lowercaseString;
     if (!lowercaseSelector.length) {
-        return NO;
+        return nil;
     }
 
-    NSArray<NSString *> *tokens = @[
-        @"ump",
-        @"unifiedmedia",
-        @"unified_media",
-        @"mediapipeline",
-        @"media_pipeline",
+    NSArray<NSString *> *targetTokens = @[
         @"attestation",
         @"integrity",
         @"proof",
-        @"pot",
-        @"playbacktoken"
+        @"potoken",
+        @"playbacktoken",
+        @"po_token",
+        @"iosguard",
+        @"botguard",
+        @"droidguard",
+        @"onesieump",
+        @"mediapipeline",
+        @"media_pipeline",
+        @"unifiedmedia",
+        @"unified_media",
+        @"useump",
+        @"videoplaybackuseump",
+        @"ump"
     ];
 
-    for (NSString *token in tokens) {
+    BOOL matchesTarget = NO;
+    for (NSString *token in targetTokens) {
         if ([lowercaseSelector containsString:token]) {
-            return YES;
+            matchesTarget = YES;
+            break;
         }
     }
-    return NO;
+    if (!matchesTarget) {
+        return nil;
+    }
+
+    if ([lowercaseSelector containsString:@"disable"] ||
+        [lowercaseSelector containsString:@"disabled"] ||
+        [lowercaseSelector containsString:@"turnoff"] ||
+        [lowercaseSelector containsString:@"optout"] ||
+        [lowercaseSelector containsString:@"omit"]) {
+        return @(YES);
+    }
+
+    if ([lowercaseSelector containsString:@"enable"] ||
+        [lowercaseSelector containsString:@"enabled"] ||
+        [lowercaseSelector containsString:@"require"] ||
+        [lowercaseSelector containsString:@"requires"] ||
+        [lowercaseSelector containsString:@"use"] ||
+        [lowercaseSelector containsString:@"should"] ||
+        [lowercaseSelector containsString:@"allow"] ||
+        [lowercaseSelector containsString:@"need"] ||
+        [lowercaseSelector containsString:@"has"] ||
+        [lowercaseSelector containsString:@"is"]) {
+        return @(NO);
+    }
+
+    return @(NO);
+}
+
+static BOOL shouldPatchPlaybackCompatibilitySelector(NSString *selectorName) {
+    return desiredCompatibilityBoolValueForSelector(selectorName) != nil;
 }
 
 static BOOL methodReturnsBoolean(Method method) {
@@ -679,15 +721,23 @@ static NSUInteger patchPlaybackCompatibilityMethodsOnClass(Class cls, NSString *
             continue;
         }
 
-        if (method_getImplementation(method) == (IMP)playbackCompatibilityReturnNO) {
+        NSNumber *desiredValue = desiredCompatibilityBoolValueForSelector(selectorName);
+        if (!desiredValue) {
             continue;
         }
 
-        method_setImplementation(method, (IMP)playbackCompatibilityReturnNO);
+        IMP replacement = desiredValue.boolValue ? (IMP)playbackCompatibilityReturnYES : (IMP)playbackCompatibilityReturnNO;
+
+        if (method_getImplementation(method) == replacement) {
+            continue;
+        }
+
+        method_setImplementation(method, replacement);
         patchedCount++;
 
         if (sampleSelectors.count < 6) {
-            [sampleSelectors addObject:selectorName];
+            NSString *sampleEntry = [NSString stringWithFormat:@"%@=%d", selectorName, desiredValue.boolValue ? 1 : 0];
+            [sampleSelectors addObject:sampleEntry];
         }
     }
 
