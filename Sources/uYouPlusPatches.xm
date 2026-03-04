@@ -74,7 +74,7 @@ static NSString *const kPlaybackDiagLinesKey = @"uYouEnhancedPlaybackDiagLines";
 static NSString *const kPlaybackDiagLastFailureKey = @"uYouEnhancedPlaybackDiagLastFailure";
 static NSString *const kPlaybackDiagLastUpdatedKey = @"uYouEnhancedPlaybackDiagLastUpdated";
 static NSString *const kPlaybackDiagFileName = @"uYouEnhancedPlaybackDiagnostics.txt";
-static NSUInteger const kPlaybackDiagMaxLines = 120;
+static NSUInteger const kPlaybackDiagMaxLines = 180;
 static NSUInteger const kPlaybackDiagMaxBodyCaptureBytes = 1024 * 1024;
 static NSTimeInterval const kPlaybackDiagAutoCopyThrottleSeconds = 4.0;
 static NSMutableArray<NSString *> *playbackDiagLines = nil;
@@ -89,6 +89,10 @@ static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *reasonCode);
 static void setupAVPlayerItemDiagnosticsObservers(void);
 static NSString *shortenedDiagnosticString(NSString *value, NSUInteger maxLength);
 static NSString *queryItemValueForURL(NSURL *url, NSString *targetKey);
+static NSString *queryKeySummaryForURL(NSURL *url, NSUInteger maxKeys);
+static NSString *playbackURLFingerprint(NSURL *url);
+static void logRuntimePlayerClassDiagnostics(void);
+static void enforcePlaybackIsolationDefaults(void);
 
 static dispatch_queue_t visitorDataQueue() {
     static dispatch_queue_t queue;
@@ -452,6 +456,161 @@ static NSString *queryItemValueForURL(NSURL *url, NSString *targetKey) {
     return nil;
 }
 
+static NSString *queryKeySummaryForURL(NSURL *url, NSUInteger maxKeys) {
+    if (![url isKindOfClass:[NSURL class]] || maxKeys == 0) {
+        return @"-";
+    }
+
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    NSArray<NSURLQueryItem *> *queryItems = components.queryItems;
+    if (![queryItems isKindOfClass:[NSArray class]] || queryItems.count == 0) {
+        return @"-";
+    }
+
+    NSMutableArray<NSString *> *keys = [NSMutableArray array];
+    for (NSURLQueryItem *item in queryItems) {
+        NSString *name = trimmedString(item.name).lowercaseString;
+        if (!name.length || [keys containsObject:name]) {
+            continue;
+        }
+        [keys addObject:name];
+        if (keys.count >= maxKeys) {
+            break;
+        }
+    }
+
+    if (keys.count == 0) {
+        return @"-";
+    }
+    NSString *suffix = queryItems.count > keys.count ? @"+" : @"";
+    return [NSString stringWithFormat:@"%@%@", [keys componentsJoinedByString:@","], suffix];
+}
+
+static NSString *playbackURLFingerprint(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) {
+        return @"-";
+    }
+
+    NSString *host = trimmedString(url.host.lowercaseString);
+    if (!host.length) {
+        host = @"-";
+    }
+
+    NSMutableArray<NSString *> *pathSegments = [NSMutableArray array];
+    for (NSString *segment in [url.path componentsSeparatedByString:@"/"]) {
+        NSString *trimmedSegment = trimmedString(segment);
+        if (trimmedSegment.length) {
+            [pathSegments addObject:trimmedSegment];
+        }
+    }
+
+    NSString *pathTail = @"/";
+    if (pathSegments.count > 0) {
+        NSUInteger startIndex = pathSegments.count > 2 ? pathSegments.count - 2 : 0;
+        NSArray<NSString *> *tailSegments = [pathSegments subarrayWithRange:NSMakeRange(startIndex, pathSegments.count - startIndex)];
+        pathTail = [@"/" stringByAppendingString:[tailSegments componentsJoinedByString:@"/"]];
+    }
+
+    NSString *keySummary = queryKeySummaryForURL(url, 4);
+    NSString *fingerprint = [NSString stringWithFormat:@"%@%@|k=%@", host, pathTail, keySummary];
+    return shortenedDiagnosticString(fingerprint, 78);
+}
+
+static void logRuntimePlayerClassDiagnostics(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSArray<NSString *> *classNames = @[
+            @"YTPlayerViewController",
+            @"YTIPlayerResponse",
+            @"YTMainAppVideoPlayerOverlayViewController",
+            @"MLPlayerStickySettings"
+        ];
+        NSArray<NSString *> *tokens = @[@"error", @"fail", @"state", @"playability", @"stream", @"buffer", @"stall", @"retry", @"ump"];
+
+        for (NSString *className in classNames) {
+            Class cls = NSClassFromString(className);
+            if (!cls) {
+                appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ RUNTIME_CLASS %@ missing=1", playbackDiagTimestamp(), className], nil, NO);
+                continue;
+            }
+
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(cls, &methodCount);
+            NSMutableArray<NSString *> *matches = [NSMutableArray array];
+
+            for (unsigned int i = 0; i < methodCount; i++) {
+                NSString *selectorName = NSStringFromSelector(method_getName(methods[i]));
+                NSString *lowercaseSelectorName = selectorName.lowercaseString;
+
+                BOOL shouldKeep = NO;
+                for (NSString *token in tokens) {
+                    if ([lowercaseSelectorName containsString:token]) {
+                        shouldKeep = YES;
+                        break;
+                    }
+                }
+
+                if (!shouldKeep || [matches containsObject:selectorName]) {
+                    continue;
+                }
+
+                [matches addObject:selectorName];
+                if (matches.count >= 8) {
+                    break;
+                }
+            }
+
+            if (methods) {
+                free(methods);
+            }
+
+            NSString *sample = matches.count > 0 ? [matches componentsJoinedByString:@","] : @"-";
+            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ RUNTIME_CLASS %@ methods=%u sample=%@",
+                                          playbackDiagTimestamp(),
+                                          className,
+                                          methodCount,
+                                          shortenedDiagnosticString(sample, 96)],
+                                      nil,
+                                      NO);
+        }
+    });
+}
+
+static void enforcePlaybackIsolationDefaults(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSArray<NSString *> *keysToDisable = @[
+        kAdBlockWorkaround,
+        kAdBlockWorkaroundLite,
+        kEnableVersionSpoofer,
+        kAutoRetryPlayback,
+        kFixCasting,
+        kFlex,
+        @"showPlaybackRate",
+        @"isSponsorBlockEnabled",
+        @"enableSponsorBlock"
+    ];
+
+    NSUInteger changedCount = 0;
+    for (NSString *key in keysToDisable) {
+        if (![key isKindOfClass:[NSString class]] || key.length == 0) {
+            continue;
+        }
+        if ([defaults boolForKey:key]) {
+            changedCount++;
+        }
+        [defaults setBool:NO forKey:key];
+    }
+
+    [defaults setBool:YES forKey:@"showedWelcomeVC"];
+    [defaults setBool:NO forKey:@"disableAgeRestriction"];
+
+    appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ ISOLATION_PREFS disabled=%lu",
+                                  playbackDiagTimestamp(),
+                                  (unsigned long)changedCount],
+                              nil,
+                              NO);
+}
+
 static BOOL headerLooksLoggedIn(NSDictionary *headers) {
     NSString *loggedInHeader = headerValueForKey(headers, @"X-Goog-Logged-In");
     if ([loggedInHeader isEqualToString:@"1"]) {
@@ -534,8 +693,9 @@ static void recordPlaybackHTTPStatusDiagnostic(NSURL *url, NSInteger statusCode,
         NSString *contentType = shortenedDiagnosticString(headerValueForKey(headers, @"Content-Type"), 28);
         NSString *contentLength = shortenedDiagnosticString(headerValueForKey(headers, @"Content-Length"), 14);
         NSString *contentRange = shortenedDiagnosticString(headerValueForKey(headers, @"Content-Range"), 42);
+        NSString *urlFingerprint = playbackURLFingerprint(url);
 
-        line = [NSString stringWithFormat:@"%@ %@ RES_HDR status=%ld logged=%d visitor=%d wwwAuth=%d itag=%@ range=%@ ctype=%@ clen=%@ crange=%@",
+        line = [NSString stringWithFormat:@"%@ %@ RES_HDR status=%ld logged=%d visitor=%d wwwAuth=%d itag=%@ range=%@ ctype=%@ clen=%@ crange=%@ url=%@",
                 playbackDiagTimestamp(),
                 endpoint,
                 (long)statusCode,
@@ -546,7 +706,8 @@ static void recordPlaybackHTTPStatusDiagnostic(NSURL *url, NSInteger statusCode,
                 range,
                 contentType,
                 contentLength,
-                contentRange];
+                contentRange,
+                urlFingerprint];
     } else {
         line = [NSString stringWithFormat:@"%@ %@ RES_HDR status=%ld logged=%d visitor=%d wwwAuth=%d",
                 playbackDiagTimestamp(),
@@ -650,8 +811,9 @@ static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURL
         NSString *rn = shortenedDiagnosticString(queryItemValueForURL(effectiveRequest.URL, @"rn"), 10);
         NSString *rbuf = shortenedDiagnosticString(queryItemValueForURL(effectiveRequest.URL, @"rbuf"), 10);
         NSString *clen = shortenedDiagnosticString(queryItemValueForURL(effectiveRequest.URL, @"clen"), 14);
+        NSString *urlFingerprint = playbackURLFingerprint(effectiveRequest.URL);
 
-        line = [NSString stringWithFormat:@"%@ %@ REQ m=%@ auth=%d cookie=%d logged=%d visitor=%d strip=%d inject=%d itag=%@ range=%@ rn=%@ rbuf=%@ clen=%@",
+        line = [NSString stringWithFormat:@"%@ %@ REQ m=%@ auth=%d cookie=%d logged=%d visitor=%d strip=%d inject=%d itag=%@ range=%@ rn=%@ rbuf=%@ clen=%@ url=%@",
                 playbackDiagTimestamp(),
                 endpoint,
                 method,
@@ -665,7 +827,8 @@ static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURL
                 shortenedDiagnosticString(range, 20),
                 rn,
                 rbuf,
-                clen];
+                clen,
+                urlFingerprint];
     } else {
         line = [NSString stringWithFormat:@"%@ %@ REQ m=%@ auth=%d cookie=%d logged=%d visitor=%d strip=%d inject=%d",
                 playbackDiagTimestamp(),
@@ -707,8 +870,9 @@ static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLRespons
         NSString *contentType = shortenedDiagnosticString(headerValueForKey(responseHeaders, @"Content-Type"), 28);
         NSString *contentLength = shortenedDiagnosticString(headerValueForKey(responseHeaders, @"Content-Length"), 14);
         NSString *contentRange = shortenedDiagnosticString(headerValueForKey(responseHeaders, @"Content-Range"), 42);
+        NSString *urlFingerprint = playbackURLFingerprint(request.URL);
 
-        line = [NSString stringWithFormat:@"%@ %@ RES status=%ld err=%d bytes=%lu itag=%@ range=%@ ctype=%@ clen=%@ crange=%@",
+        line = [NSString stringWithFormat:@"%@ %@ RES status=%ld err=%d bytes=%lu itag=%@ range=%@ ctype=%@ clen=%@ crange=%@ url=%@",
                 playbackDiagTimestamp(),
                 endpoint,
                 (long)statusCode,
@@ -718,7 +882,8 @@ static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLRespons
                 range,
                 contentType,
                 contentLength,
-                contentRange];
+                contentRange,
+                urlFingerprint];
     } else {
         line = [NSString stringWithFormat:@"%@ %@ RES status=%ld err=%d play=%@ reason=%@ bytes=%lu",
                 playbackDiagTimestamp(),
@@ -889,6 +1054,12 @@ static void setupAVPlayerItemDiagnosticsObservers(void) {
         if (didEndToken) {
             [playbackDiagObserverTokens addObject:didEndToken];
         }
+
+        appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ AVP_OBSERVERS_READY count=%lu",
+                                      playbackDiagTimestamp(),
+                                      (unsigned long)playbackDiagObserverTokens.count],
+                                  nil,
+                                  NO);
     });
 }
 
@@ -1301,6 +1472,41 @@ static void retainWrappedSessionDelegateProxy(NSURLSession *session, id original
     return response;
 }
 %end
+
+%hook AVPlayer
+- (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
+    NSString *status = @"-";
+    if ([item isKindOfClass:[AVPlayerItem class]]) {
+        status = [NSString stringWithFormat:@"%ld", (long)item.status];
+    }
+
+    appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ AVP_SET_ITEM hasItem=%d status=%@",
+                                  playbackDiagTimestamp(),
+                                  item != nil ? 1 : 0,
+                                  status],
+                              nil,
+                              NO);
+    %orig(item);
+}
+%end
+
+%hook UILabel
+- (void)setText:(NSString *)text {
+    if ([text isKindOfClass:[NSString class]]) {
+        NSString *normalized = text.lowercaseString;
+        if ([normalized containsString:@"something went wrong"] ||
+            [normalized containsString:@"authentication error"] ||
+            ([normalized containsString:@"playback"] && [normalized containsString:@"error"])) {
+            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ UI_ERROR_LABEL text=%@",
+                                          playbackDiagTimestamp(),
+                                          shortenedDiagnosticString(text, 80)],
+                                      @"UI_ERROR_LABEL",
+                                      YES);
+        }
+    }
+    %orig(text);
+}
+%end
 %end
 
 // Reposition "Create" Tab to the Center in the Pivot Bar - qnblackcat/uYouPlus#107
@@ -1696,6 +1902,7 @@ static void refreshUYouAppearance() {
 
     uYouEnhancedPlaybackDiagnosticsClear();
     appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ APP_INIT stage=%ld mode=observer_only", playbackDiagTimestamp(), (long)kPlaybackIsolationStage], nil, NO);
+    enforcePlaybackIsolationDefaults();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1800 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         showPlaybackDiagnosticsBanner(@"Playback diagnostics active");
     });
@@ -1703,6 +1910,10 @@ static void refreshUYouAppearance() {
 
     %init(gGoogleSignInPatch);
     %init(gVisitorDataFix);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1200 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        logRuntimePlayerClassDiagnostics();
+    });
 
     if (kPlaybackIsolationStage == 1) {
         return;
