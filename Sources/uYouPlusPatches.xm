@@ -463,22 +463,68 @@ static NSString *playbackEndpointCodeForURL(NSURL *url) {
         return nil;
     }
 
-    if ([absoluteString containsString:@"youtubei/v1/player"]) {
-        return @"IT_PLAYER";
-    }
-    if ([absoluteString containsString:@"youtubei/v1/next"]) {
-        return @"IT_NEXT";
-    }
-    if ([absoluteString containsString:@"youtubei/v1/get_watch"]) {
-        return @"IT_GET_WATCH";
-    }
-    if ([absoluteString containsString:@"youtubei/v1/reel/reel_watch_sequence"]) {
-        return @"IT_REEL_WATCH";
-    }
     if ([absoluteString containsString:@"googlevideo.com"] && [absoluteString containsString:@"videoplayback"]) {
         return @"GV_MEDIA";
     }
+
+    NSRange innerTubeRange = [absoluteString rangeOfString:@"youtubei/v1/"];
+    if (innerTubeRange.location != NSNotFound) {
+        NSString *endpointSuffix = [absoluteString substringFromIndex:(innerTubeRange.location + innerTubeRange.length)];
+        NSRange queryRange = [endpointSuffix rangeOfString:@"?"];
+        if (queryRange.location != NSNotFound) {
+            endpointSuffix = [endpointSuffix substringToIndex:queryRange.location];
+        }
+        if (!endpointSuffix.length) {
+            return @"IT_UNKNOWN";
+        }
+
+        NSMutableString *sanitized = [NSMutableString stringWithString:@"IT_"];
+        NSCharacterSet *validSet = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyz0123456789"];
+        for (NSUInteger idx = 0; idx < endpointSuffix.length; idx++) {
+            unichar ch = [endpointSuffix characterAtIndex:idx];
+            NSString *charString = [[NSString stringWithCharacters:&ch length:1] lowercaseString];
+            if ([validSet characterIsMember:[charString characterAtIndex:0]]) {
+                [sanitized appendString:[charString uppercaseString]];
+            } else {
+                [sanitized appendString:@"_"];
+            }
+            if (sanitized.length >= 36) {
+                break;
+            }
+        }
+
+        while ([sanitized containsString:@"__"]) {
+            [sanitized replaceOccurrencesOfString:@"__" withString:@"_" options:0 range:NSMakeRange(0, sanitized.length)];
+        }
+        if ([sanitized hasSuffix:@"_"]) {
+            [sanitized deleteCharactersInRange:NSMakeRange(sanitized.length - 1, 1)];
+        }
+        return sanitized.length ? sanitized : @"IT_UNKNOWN";
+    }
+
     return nil;
+}
+
+static void recordPlaybackHTTPStatusDiagnostic(NSURL *url, NSInteger statusCode, NSDictionary *headers) {
+    NSString *endpoint = playbackEndpointCodeForURL(url);
+    if (!endpoint.length) {
+        return;
+    }
+
+    NSString *visitorHeader = headerValueForKey(headers, @"X-Goog-Visitor-Id");
+    NSString *wwwAuthenticate = headerValueForKey(headers, @"WWW-Authenticate");
+    BOOL loggedIn = headerLooksLoggedIn(headers);
+
+    NSString *line = [NSString stringWithFormat:@"%@ %@ RES_HDR status=%ld logged=%d visitor=%d wwwAuth=%d",
+                      playbackDiagTimestamp(),
+                      endpoint,
+                      (long)statusCode,
+                      loggedIn ? 1 : 0,
+                      visitorHeader.length > 0 ? 1 : 0,
+                      wwwAuthenticate.length > 0 ? 1 : 0];
+
+    NSString *failureCode = statusCode >= 400 ? [NSString stringWithFormat:@"%@_%ld", endpoint, (long)statusCode] : nil;
+    appendPlaybackDiagnosticLine(line, failureCode, statusCode >= 400);
 }
 
 static NSString *playabilityStatusFromData(NSData *data) {
@@ -872,6 +918,16 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
 %end
 
 %hook NSURLSession
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url {
+    NSURLRequest *request = [NSURLRequest requestWithURL:url];
+    return [self dataTaskWithRequest:request];
+}
+
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    NSURLRequest *request = [NSURLRequest requestWithURL:url];
+    return [self dataTaskWithRequest:request completionHandler:completionHandler];
+}
+
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     return %orig(requestByInjectingVisitorDataIfNeeded(request));
 }
@@ -888,6 +944,10 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
     return %orig(patchedRequest, wrappedCompletion);
 }
 
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData {
+    return %orig(requestByInjectingVisitorDataIfNeeded(request), bodyData);
+}
+
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
     NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
     void (^wrappedCompletion)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -898,6 +958,59 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
         }
     };
     return %orig(patchedRequest, bodyData, wrappedCompletion);
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL {
+    return %orig(requestByInjectingVisitorDataIfNeeded(request), fileURL);
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
+    void (^wrappedCompletion)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+        cacheVisitorDataFromResponse(response, data);
+        recordPlaybackResponseDiagnostic(patchedRequest, response, data, error);
+        if (completionHandler) {
+            completionHandler(data, response, error);
+        }
+    };
+    return %orig(patchedRequest, fileURL, wrappedCompletion);
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithStreamedRequest:(NSURLRequest *)request {
+    return %orig(requestByInjectingVisitorDataIfNeeded(request));
+}
+
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request {
+    return %orig(requestByInjectingVisitorDataIfNeeded(request));
+}
+
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURL *location, NSURLResponse *response, NSError *error))completionHandler {
+    NSURLRequest *patchedRequest = requestByInjectingVisitorDataIfNeeded(request);
+    void (^wrappedCompletion)(NSURL *location, NSURLResponse *response, NSError *error) = ^(NSURL *location, NSURLResponse *response, NSError *error) {
+        recordPlaybackResponseDiagnostic(patchedRequest, response, nil, error);
+        if (completionHandler) {
+            completionHandler(location, response, error);
+        }
+    };
+    return %orig(patchedRequest, wrappedCompletion);
+}
+
+- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url {
+    NSURLRequest *request = [NSURLRequest requestWithURL:url];
+    return [self downloadTaskWithRequest:request];
+}
+
+- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSURL *location, NSURLResponse *response, NSError *error))completionHandler {
+    NSURLRequest *request = [NSURLRequest requestWithURL:url];
+    return [self downloadTaskWithRequest:request completionHandler:completionHandler];
+}
+%end
+
+%hook NSHTTPURLResponse
+- (instancetype)initWithURL:(NSURL *)URL statusCode:(NSInteger)statusCode HTTPVersion:(NSString *)HTTPVersion headerFields:(NSDictionary *)headerFields {
+    id response = %orig(URL, statusCode, HTTPVersion, headerFields);
+    recordPlaybackHTTPStatusDiagnostic(URL, statusCode, headerFields);
+    return response;
 }
 %end
 %end
