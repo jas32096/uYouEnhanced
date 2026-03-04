@@ -1,5 +1,6 @@
 #import "uYouPlusPatches.h"
 #import <AVFoundation/AVFoundation.h>
+#import <objc/runtime.h>
 
 #define YT_BUNDLE_ID @"com.google.ios.youtube"
 #define YT_NAME @"YouTube"
@@ -74,6 +75,7 @@ static NSString *const kPlaybackDiagLastFailureKey = @"uYouEnhancedPlaybackDiagL
 static NSString *const kPlaybackDiagLastUpdatedKey = @"uYouEnhancedPlaybackDiagLastUpdated";
 static NSString *const kPlaybackDiagFileName = @"uYouEnhancedPlaybackDiagnostics.txt";
 static NSUInteger const kPlaybackDiagMaxLines = 120;
+static NSUInteger const kPlaybackDiagMaxBodyCaptureBytes = 1024 * 1024;
 static NSTimeInterval const kPlaybackDiagAutoCopyThrottleSeconds = 4.0;
 static NSMutableArray<NSString *> *playbackDiagLines = nil;
 static NSString *playbackDiagLastAutoCopiedFailure = nil;
@@ -85,6 +87,8 @@ static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURL
 static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLResponse *response, NSData *data, NSError *error);
 static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *reasonCode);
 static void setupAVPlayerItemDiagnosticsObservers(void);
+static NSString *shortenedDiagnosticString(NSString *value, NSUInteger maxLength);
+static NSString *queryItemValueForURL(NSURL *url, NSString *targetKey);
 
 static dispatch_queue_t visitorDataQueue() {
     static dispatch_queue_t queue;
@@ -426,6 +430,28 @@ static BOOL isGoogleVideoPlaybackRequest(NSURL *url) {
     return [path containsString:@"videoplayback"];
 }
 
+static NSString *queryItemValueForURL(NSURL *url, NSString *targetKey) {
+    if (![url isKindOfClass:[NSURL class]] || !targetKey.length) {
+        return nil;
+    }
+
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    if (![components.queryItems isKindOfClass:[NSArray class]]) {
+        return nil;
+    }
+
+    for (NSURLQueryItem *item in components.queryItems) {
+        if (![item.name isKindOfClass:[NSString class]]) {
+            continue;
+        }
+        if ([item.name caseInsensitiveCompare:targetKey] == NSOrderedSame) {
+            return trimmedString(item.value);
+        }
+    }
+
+    return nil;
+}
+
 static BOOL headerLooksLoggedIn(NSDictionary *headers) {
     NSString *loggedInHeader = headerValueForKey(headers, @"X-Goog-Logged-In");
     if ([loggedInHeader isEqualToString:@"1"]) {
@@ -501,20 +527,42 @@ static void recordPlaybackHTTPStatusDiagnostic(NSURL *url, NSInteger statusCode,
     NSString *wwwAuthenticate = headerValueForKey(headers, @"WWW-Authenticate");
     BOOL loggedIn = headerLooksLoggedIn(headers);
 
-    NSString *line = [NSString stringWithFormat:@"%@ %@ RES_HDR status=%ld logged=%d visitor=%d wwwAuth=%d",
-                      playbackDiagTimestamp(),
-                      endpoint,
-                      (long)statusCode,
-                      loggedIn ? 1 : 0,
-                      visitorHeader.length > 0 ? 1 : 0,
-                      wwwAuthenticate.length > 0 ? 1 : 0];
+    NSString *line = nil;
+    if ([endpoint isEqualToString:@"GV_MEDIA"]) {
+        NSString *itag = shortenedDiagnosticString(queryItemValueForURL(url, @"itag"), 8);
+        NSString *range = shortenedDiagnosticString(queryItemValueForURL(url, @"range"), 20);
+        NSString *contentType = shortenedDiagnosticString(headerValueForKey(headers, @"Content-Type"), 28);
+        NSString *contentLength = shortenedDiagnosticString(headerValueForKey(headers, @"Content-Length"), 14);
+        NSString *contentRange = shortenedDiagnosticString(headerValueForKey(headers, @"Content-Range"), 42);
+
+        line = [NSString stringWithFormat:@"%@ %@ RES_HDR status=%ld logged=%d visitor=%d wwwAuth=%d itag=%@ range=%@ ctype=%@ clen=%@ crange=%@",
+                playbackDiagTimestamp(),
+                endpoint,
+                (long)statusCode,
+                loggedIn ? 1 : 0,
+                visitorHeader.length > 0 ? 1 : 0,
+                wwwAuthenticate.length > 0 ? 1 : 0,
+                itag,
+                range,
+                contentType,
+                contentLength,
+                contentRange];
+    } else {
+        line = [NSString stringWithFormat:@"%@ %@ RES_HDR status=%ld logged=%d visitor=%d wwwAuth=%d",
+                playbackDiagTimestamp(),
+                endpoint,
+                (long)statusCode,
+                loggedIn ? 1 : 0,
+                visitorHeader.length > 0 ? 1 : 0,
+                wwwAuthenticate.length > 0 ? 1 : 0];
+    }
 
     NSString *failureCode = statusCode >= 400 ? [NSString stringWithFormat:@"%@_%ld", endpoint, (long)statusCode] : nil;
     appendPlaybackDiagnosticLine(line, failureCode, statusCode >= 400);
 }
 
 static NSString *playabilityStatusFromData(NSData *data) {
-    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > (1024 * 1024)) {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > kPlaybackDiagMaxBodyCaptureBytes) {
         return nil;
     }
 
@@ -538,7 +586,7 @@ static NSString *playabilityStatusFromData(NSData *data) {
 }
 
 static NSString *playabilityReasonSnippetFromData(NSData *data) {
-    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > (1024 * 1024)) {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > kPlaybackDiagMaxBodyCaptureBytes) {
         return nil;
     }
 
@@ -592,16 +640,44 @@ static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURL
     BOOL signedInCookie = headersContainSignedInCookie(cookieHeader);
     NSString *method = effectiveRequest.HTTPMethod ?: @"GET";
 
-    NSString *line = [NSString stringWithFormat:@"%@ %@ REQ m=%@ auth=%d cookie=%d logged=%d visitor=%d strip=%d inject=%d",
-                      playbackDiagTimestamp(),
-                      endpoint,
-                      method,
-                      authorizationHeader.length > 0 ? 1 : 0,
-                      signedInCookie ? 1 : 0,
-                      loggedIn ? 1 : 0,
-                      visitorHeader.length > 0 ? 1 : 0,
-                      strippedAuthHeaders ? 1 : 0,
-                      injectedVisitorHeader ? 1 : 0];
+    NSString *line = nil;
+    if ([endpoint isEqualToString:@"GV_MEDIA"]) {
+        NSString *itag = shortenedDiagnosticString(queryItemValueForURL(effectiveRequest.URL, @"itag"), 8);
+        NSString *range = queryItemValueForURL(effectiveRequest.URL, @"range");
+        if (!range.length) {
+            range = headerValueForKey(headers, @"Range");
+        }
+        NSString *rn = shortenedDiagnosticString(queryItemValueForURL(effectiveRequest.URL, @"rn"), 10);
+        NSString *rbuf = shortenedDiagnosticString(queryItemValueForURL(effectiveRequest.URL, @"rbuf"), 10);
+        NSString *clen = shortenedDiagnosticString(queryItemValueForURL(effectiveRequest.URL, @"clen"), 14);
+
+        line = [NSString stringWithFormat:@"%@ %@ REQ m=%@ auth=%d cookie=%d logged=%d visitor=%d strip=%d inject=%d itag=%@ range=%@ rn=%@ rbuf=%@ clen=%@",
+                playbackDiagTimestamp(),
+                endpoint,
+                method,
+                authorizationHeader.length > 0 ? 1 : 0,
+                signedInCookie ? 1 : 0,
+                loggedIn ? 1 : 0,
+                visitorHeader.length > 0 ? 1 : 0,
+                strippedAuthHeaders ? 1 : 0,
+                injectedVisitorHeader ? 1 : 0,
+                itag,
+                shortenedDiagnosticString(range, 20),
+                rn,
+                rbuf,
+                clen];
+    } else {
+        line = [NSString stringWithFormat:@"%@ %@ REQ m=%@ auth=%d cookie=%d logged=%d visitor=%d strip=%d inject=%d",
+                playbackDiagTimestamp(),
+                endpoint,
+                method,
+                authorizationHeader.length > 0 ? 1 : 0,
+                signedInCookie ? 1 : 0,
+                loggedIn ? 1 : 0,
+                visitorHeader.length > 0 ? 1 : 0,
+                strippedAuthHeaders ? 1 : 0,
+                injectedVisitorHeader ? 1 : 0];
+    }
     appendPlaybackDiagnosticLine(line, nil, NO);
 }
 
@@ -616,16 +692,43 @@ static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLRespons
         statusCode = ((NSHTTPURLResponse *)response).statusCode;
     }
 
+    NSDictionary *responseHeaders = nil;
+    if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+        responseHeaders = ((NSHTTPURLResponse *)response).allHeaderFields;
+    }
+
     NSString *playabilityStatus = playabilityStatusFromData(data);
     NSString *playabilityReason = playabilityReasonSnippetFromData(data);
-    NSString *line = [NSString stringWithFormat:@"%@ %@ RES status=%ld err=%d play=%@ reason=%@ bytes=%lu",
-                      playbackDiagTimestamp(),
-                      endpoint,
-                      (long)statusCode,
-                      error ? 1 : 0,
-                      playabilityStatus ?: @"-",
-                      playabilityReason ?: @"-",
-                      (unsigned long)data.length];
+
+    NSString *line = nil;
+    if ([endpoint isEqualToString:@"GV_MEDIA"]) {
+        NSString *itag = shortenedDiagnosticString(queryItemValueForURL(request.URL, @"itag"), 8);
+        NSString *range = shortenedDiagnosticString(queryItemValueForURL(request.URL, @"range"), 20);
+        NSString *contentType = shortenedDiagnosticString(headerValueForKey(responseHeaders, @"Content-Type"), 28);
+        NSString *contentLength = shortenedDiagnosticString(headerValueForKey(responseHeaders, @"Content-Length"), 14);
+        NSString *contentRange = shortenedDiagnosticString(headerValueForKey(responseHeaders, @"Content-Range"), 42);
+
+        line = [NSString stringWithFormat:@"%@ %@ RES status=%ld err=%d bytes=%lu itag=%@ range=%@ ctype=%@ clen=%@ crange=%@",
+                playbackDiagTimestamp(),
+                endpoint,
+                (long)statusCode,
+                error ? 1 : 0,
+                (unsigned long)data.length,
+                itag,
+                range,
+                contentType,
+                contentLength,
+                contentRange];
+    } else {
+        line = [NSString stringWithFormat:@"%@ %@ RES status=%ld err=%d play=%@ reason=%@ bytes=%lu",
+                playbackDiagTimestamp(),
+                endpoint,
+                (long)statusCode,
+                error ? 1 : 0,
+                playabilityStatus ?: @"-",
+                playabilityReason ?: @"-",
+                (unsigned long)data.length];
+    }
 
     NSString *failureCode = nil;
     if (error) {
@@ -648,6 +751,34 @@ static NSString *shortenedDiagnosticString(NSString *value, NSUInteger maxLength
         return [singleLine substringToIndex:maxLength];
     }
     return singleLine;
+}
+
+static void recordAVPlayerAccessLogDiagnostic(AVPlayerItem *item) {
+    if (!item || ![item respondsToSelector:@selector(accessLog)]) {
+        appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ AVP_ACCESS none=1", playbackDiagTimestamp()], nil, NO);
+        return;
+    }
+
+    AVPlayerItemAccessLog *accessLog = [item accessLog];
+    AVPlayerItemAccessLogEvent *event = [accessLog.events lastObject];
+    if (!event) {
+        appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ AVP_ACCESS empty=1", playbackDiagTimestamp()], nil, NO);
+        return;
+    }
+
+    NSString *uri = shortenedDiagnosticString(event.URI, 80);
+    NSString *serverAddress = shortenedDiagnosticString(event.serverAddress, 40);
+    NSString *line = [NSString stringWithFormat:@"%@ AVP_ACCESS seg=%ld bytes=%lld obs=%.0f ind=%.0f stalls=%ld xfer=%.2f server=%@ uri=%@",
+                      playbackDiagTimestamp(),
+                      (long)event.numberOfSegmentsDownloaded,
+                      (long long)event.numberOfBytesTransferred,
+                      event.observedBitrate,
+                      event.indicatedBitrate,
+                      (long)event.numberOfStalls,
+                      event.transferDuration,
+                      serverAddress,
+                      uri];
+    appendPlaybackDiagnosticLine(line, nil, NO);
 }
 
 static void recordAVPlayerItemDiagnostic(NSString *eventCode, AVPlayerItem *item, NSError *error, BOOL shouldShowBanner) {
@@ -737,6 +868,27 @@ static void setupAVPlayerItemDiagnosticsObservers(void) {
         if (errorLogToken) {
             [playbackDiagObserverTokens addObject:errorLogToken];
         }
+
+        id accessLogToken = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemNewAccessLogEntryNotification
+                                                                               object:nil
+                                                                                queue:[NSOperationQueue mainQueue]
+                                                                           usingBlock:^(NSNotification *note) {
+            AVPlayerItem *item = [note.object isKindOfClass:[AVPlayerItem class]] ? (AVPlayerItem *)note.object : nil;
+            recordAVPlayerAccessLogDiagnostic(item);
+        }];
+        if (accessLogToken) {
+            [playbackDiagObserverTokens addObject:accessLogToken];
+        }
+
+        id didEndToken = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
+                                                                             object:nil
+                                                                              queue:[NSOperationQueue mainQueue]
+                                                                         usingBlock:^(NSNotification *note) {
+            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ AVP_DID_END", playbackDiagTimestamp()], nil, NO);
+        }];
+        if (didEndToken) {
+            [playbackDiagObserverTokens addObject:didEndToken];
+        }
     });
 }
 
@@ -770,7 +922,7 @@ static NSString *extractVisitorDataFromString(NSString *text) {
 }
 
 static NSString *extractVisitorDataFromBody(NSData *data) {
-    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > (1024 * 1024)) {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > kPlaybackDiagMaxBodyCaptureBytes) {
         return nil;
     }
     NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
@@ -839,6 +991,191 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
     }
 }
 
+@interface UYEPlaybackSessionDelegateProxy : NSObject <NSURLSessionDelegate, NSURLSessionTaskDelegate, NSURLSessionDataDelegate, NSURLSessionDownloadDelegate>
+- (instancetype)initWithDelegate:(id)delegate;
+@end
+
+@implementation UYEPlaybackSessionDelegateProxy {
+    id _delegate;
+    NSMutableSet<NSNumber *> *_trackedTaskIDs;
+    NSMutableDictionary<NSNumber *, NSMutableData *> *_capturedTaskData;
+    NSMutableDictionary<NSNumber *, NSURLRequest *> *_capturedTaskRequests;
+}
+
+- (instancetype)initWithDelegate:(id)delegate {
+    self = [super init];
+    if (self) {
+        _delegate = delegate;
+        _trackedTaskIDs = [NSMutableSet set];
+        _capturedTaskData = [NSMutableDictionary dictionary];
+        _capturedTaskRequests = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+
+- (BOOL)respondsToSelector:(SEL)selector {
+    return [super respondsToSelector:selector] || [_delegate respondsToSelector:selector];
+}
+
+- (BOOL)conformsToProtocol:(Protocol *)aProtocol {
+    return [super conformsToProtocol:aProtocol] || [_delegate conformsToProtocol:aProtocol];
+}
+
+- (id)forwardingTargetForSelector:(SEL)selector {
+    if ([_delegate respondsToSelector:selector]) {
+        return _delegate;
+    }
+    return [super forwardingTargetForSelector:selector];
+}
+
+- (NSNumber *)taskKeyForTask:(NSURLSessionTask *)task {
+    if (![task isKindOfClass:[NSURLSessionTask class]]) {
+        return nil;
+    }
+    return @(task.taskIdentifier);
+}
+
+- (void)beginTrackingTask:(NSURLSessionTask *)task response:(NSURLResponse *)response {
+    NSNumber *taskKey = [self taskKeyForTask:task];
+    if (!taskKey) {
+        return;
+    }
+
+    NSURLRequest *request = task.currentRequest ?: task.originalRequest;
+    NSURL *url = request.URL ?: response.URL;
+    if (!playbackEndpointCodeForURL(url).length) {
+        return;
+    }
+
+    @synchronized (self) {
+        [_trackedTaskIDs addObject:taskKey];
+        if (request) {
+            _capturedTaskRequests[taskKey] = request;
+        }
+        if (!_capturedTaskData[taskKey]) {
+            _capturedTaskData[taskKey] = [NSMutableData data];
+        }
+    }
+}
+
+- (void)appendData:(NSData *)data forTask:(NSURLSessionTask *)task {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0) {
+        return;
+    }
+
+    NSNumber *taskKey = [self taskKeyForTask:task];
+    if (!taskKey) {
+        return;
+    }
+
+    @synchronized (self) {
+        if (![_trackedTaskIDs containsObject:taskKey]) {
+            return;
+        }
+
+        NSMutableData *buffer = _capturedTaskData[taskKey];
+        if (!buffer) {
+            buffer = [NSMutableData data];
+            _capturedTaskData[taskKey] = buffer;
+        }
+
+        if (buffer.length >= kPlaybackDiagMaxBodyCaptureBytes) {
+            return;
+        }
+
+        NSUInteger remainingBytes = kPlaybackDiagMaxBodyCaptureBytes - buffer.length;
+        NSData *chunk = data;
+        if (chunk.length > remainingBytes) {
+            chunk = [chunk subdataWithRange:NSMakeRange(0, remainingBytes)];
+        }
+        [buffer appendData:chunk];
+    }
+}
+
+- (void)finishTrackingTask:(NSURLSessionTask *)task error:(NSError *)error {
+    NSNumber *taskKey = [self taskKeyForTask:task];
+    NSURLRequest *fallbackRequest = task.currentRequest ?: task.originalRequest;
+    NSURLResponse *response = task.response;
+
+    BOOL tracked = NO;
+    NSData *capturedData = nil;
+    NSURLRequest *capturedRequest = nil;
+
+    if (taskKey) {
+        @synchronized (self) {
+            tracked = [_trackedTaskIDs containsObject:taskKey];
+            if (tracked) {
+                capturedData = [_capturedTaskData[taskKey] copy];
+                capturedRequest = _capturedTaskRequests[taskKey];
+                [_trackedTaskIDs removeObject:taskKey];
+                [_capturedTaskData removeObjectForKey:taskKey];
+                [_capturedTaskRequests removeObjectForKey:taskKey];
+            }
+        }
+    }
+
+    if (!tracked) {
+        NSURL *url = fallbackRequest.URL ?: response.URL;
+        tracked = playbackEndpointCodeForURL(url).length > 0;
+    }
+
+    if (!tracked) {
+        return;
+    }
+
+    NSURLRequest *request = capturedRequest ?: fallbackRequest;
+    if (!request && [response.URL isKindOfClass:[NSURL class]]) {
+        request = [NSURLRequest requestWithURL:response.URL];
+    }
+    cacheVisitorDataFromResponse(response, capturedData);
+    recordPlaybackResponseDiagnostic(request, response, capturedData, error);
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveResponse:(NSURLResponse *)response completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
+    [self beginTrackingTask:dataTask response:response];
+
+    if ([_delegate respondsToSelector:_cmd]) {
+        [(id<NSURLSessionDataDelegate>)_delegate URLSession:session dataTask:dataTask didReceiveResponse:response completionHandler:completionHandler];
+        return;
+    }
+
+    if (completionHandler) {
+        completionHandler(NSURLSessionResponseAllow);
+    }
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    [self appendData:data forTask:dataTask];
+
+    if ([_delegate respondsToSelector:_cmd]) {
+        [(id<NSURLSessionDataDelegate>)_delegate URLSession:session dataTask:dataTask didReceiveData:data];
+    }
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    [self finishTrackingTask:task error:error];
+
+    if ([_delegate respondsToSelector:_cmd]) {
+        [(id<NSURLSessionTaskDelegate>)_delegate URLSession:session task:task didCompleteWithError:error];
+    }
+}
+@end
+
+static const void *kPlaybackDiagSessionDelegateProxyAssociationKey = &kPlaybackDiagSessionDelegateProxyAssociationKey;
+
+static id wrappedSessionDelegateForPlaybackDiagnostics(id delegate) {
+    if (!delegate || [delegate isKindOfClass:[UYEPlaybackSessionDelegateProxy class]]) {
+        return delegate;
+    }
+    return [[UYEPlaybackSessionDelegateProxy alloc] initWithDelegate:delegate];
+}
+
+static void retainWrappedSessionDelegateProxy(NSURLSession *session, id originalDelegate, id wrappedDelegate) {
+    if (session && wrappedDelegate && wrappedDelegate != originalDelegate) {
+        objc_setAssociatedObject(session, kPlaybackDiagSessionDelegateProxyAssociationKey, wrappedDelegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 %group gVisitorDataFix
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
@@ -855,6 +1192,20 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
 %end
 
 %hook NSURLSession
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration delegate:(id<NSURLSessionDelegate>)delegate delegateQueue:(NSOperationQueue *)queue {
+    id wrappedDelegate = wrappedSessionDelegateForPlaybackDiagnostics(delegate);
+    NSURLSession *session = %orig(configuration, wrappedDelegate, queue);
+    retainWrappedSessionDelegateProxy(session, delegate, wrappedDelegate);
+    return session;
+}
+
+- (instancetype)initWithConfiguration:(NSURLSessionConfiguration *)configuration delegate:(id<NSURLSessionDelegate>)delegate delegateQueue:(NSOperationQueue *)queue {
+    id wrappedDelegate = wrappedSessionDelegateForPlaybackDiagnostics(delegate);
+    NSURLSession *session = %orig(configuration, wrappedDelegate, queue);
+    retainWrappedSessionDelegateProxy(session, delegate, wrappedDelegate);
+    return session;
+}
+
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url {
     NSURLRequest *request = [NSURLRequest requestWithURL:url];
     return [self dataTaskWithRequest:request];
