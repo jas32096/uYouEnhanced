@@ -1,4 +1,5 @@
 #import "uYouPlusPatches.h"
+#import <AVFoundation/AVFoundation.h>
 
 #define YT_BUNDLE_ID @"com.google.ios.youtube"
 #define YT_NAME @"YouTube"
@@ -68,7 +69,6 @@ static BOOL const kEnableGoogleSignInBundlePatch = NO;
 
 static NSString *const kCachedVisitorDataKey = @"uYouEnhancedCachedVisitorData";
 static NSString *cachedVisitorData = nil;
-static BOOL visitorBootstrapRequested = NO;
 static NSString *const kPlaybackDiagLinesKey = @"uYouEnhancedPlaybackDiagLines";
 static NSString *const kPlaybackDiagLastFailureKey = @"uYouEnhancedPlaybackDiagLastFailure";
 static NSString *const kPlaybackDiagLastUpdatedKey = @"uYouEnhancedPlaybackDiagLastUpdated";
@@ -78,11 +78,13 @@ static NSTimeInterval const kPlaybackDiagAutoCopyThrottleSeconds = 4.0;
 static NSMutableArray<NSString *> *playbackDiagLines = nil;
 static NSString *playbackDiagLastAutoCopiedFailure = nil;
 static NSDate *playbackDiagLastAutoCopiedAt = nil;
+static NSMutableArray *playbackDiagObserverTokens = nil;
 
 static NSString *playbackEndpointCodeForURL(NSURL *url);
 static void recordPlaybackRequestDiagnostic(NSURLRequest *originalRequest, NSURLRequest *patchedRequest, BOOL strippedAuthHeaders, BOOL injectedVisitorHeader);
 static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLResponse *response, NSData *data, NSError *error);
 static void autoCopyPlaybackDiagnosticsIfNeeded(NSString *reasonCode);
+static void setupAVPlayerItemDiagnosticsObservers(void);
 
 static dispatch_queue_t visitorDataQueue() {
     static dispatch_queue_t queue;
@@ -437,22 +439,6 @@ static BOOL headerLooksLoggedIn(NSDictionary *headers) {
     return NO;
 }
 
-static BOOL shouldStripSignedInHeadersForURL(NSURL *url) {
-    return isGoogleVideoPlaybackRequest(url);
-}
-
-static BOOL isBlockedSignedInHeaderField(NSString *field) {
-    if (![field isKindOfClass:[NSString class]]) {
-        return NO;
-    }
-    NSString *lowerField = field.lowercaseString;
-    return [lowerField isEqualToString:@"authorization"] ||
-           [lowerField isEqualToString:@"cookie"] ||
-           [lowerField isEqualToString:@"x-goog-authuser"] ||
-           [lowerField isEqualToString:@"x-goog-pageid"] ||
-           [lowerField isEqualToString:@"x-goog-device-auth"];
-}
-
 static NSString *playbackEndpointCodeForURL(NSURL *url) {
     if (![url isKindOfClass:[NSURL class]]) {
         return nil;
@@ -653,21 +639,105 @@ static void recordPlaybackResponseDiagnostic(NSURLRequest *request, NSURLRespons
     appendPlaybackDiagnosticLine(line, failureCode, YES);
 }
 
-static NSString *extractVisitorDataFromURL(NSURL *url) {
-    if (![url isKindOfClass:[NSURL class]]) {
-        return nil;
+static NSString *shortenedDiagnosticString(NSString *value, NSUInteger maxLength) {
+    if (![value isKindOfClass:[NSString class]] || value.length == 0) {
+        return @"-";
     }
-    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-    for (NSURLQueryItem *queryItem in components.queryItems) {
-        if (![queryItem.name isKindOfClass:[NSString class]]) {
-            continue;
-        }
-        NSString *key = queryItem.name.lowercaseString;
-        if ([key isEqualToString:@"visitordata"] || [key isEqualToString:@"visitor_data"]) {
-            return trimmedString(queryItem.value);
+    NSString *singleLine = [[value componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] componentsJoinedByString:@" "];
+    if (singleLine.length > maxLength) {
+        return [singleLine substringToIndex:maxLength];
+    }
+    return singleLine;
+}
+
+static void recordAVPlayerItemDiagnostic(NSString *eventCode, AVPlayerItem *item, NSError *error, BOOL shouldShowBanner) {
+    if (!eventCode.length) {
+        return;
+    }
+
+    NSError *itemError = error;
+    if (!itemError && [item respondsToSelector:@selector(error)]) {
+        itemError = item.error;
+    }
+
+    NSInteger errorCode = itemError ? itemError.code : 0;
+    NSString *errorDomain = itemError ? shortenedDiagnosticString(itemError.domain, 40) : @"-";
+
+    NSInteger errorStatusCode = 0;
+    NSString *errorLogDomain = @"-";
+    NSString *errorLogComment = @"-";
+    NSString *errorLogURI = @"-";
+
+    if (item && [item respondsToSelector:@selector(errorLog)]) {
+        AVPlayerItemErrorLog *errorLog = [item errorLog];
+        AVPlayerItemErrorLogEvent *lastEvent = [errorLog.events lastObject];
+        if (lastEvent) {
+            errorStatusCode = lastEvent.errorStatusCode;
+            errorLogDomain = shortenedDiagnosticString(lastEvent.errorDomain, 40);
+            errorLogComment = shortenedDiagnosticString(lastEvent.errorComment, 80);
+            errorLogURI = shortenedDiagnosticString(lastEvent.uri, 80);
         }
     }
-    return nil;
+
+    NSString *line = [NSString stringWithFormat:@"%@ AVP_%@ code=%ld domain=%@ http=%ld edomain=%@ comment=%@ uri=%@",
+                      playbackDiagTimestamp(),
+                      eventCode,
+                      (long)errorCode,
+                      errorDomain,
+                      (long)errorStatusCode,
+                      errorLogDomain,
+                      errorLogComment,
+                      errorLogURI];
+
+    NSString *failureCode = nil;
+    if (errorStatusCode >= 400) {
+        failureCode = [NSString stringWithFormat:@"AVP_%@_%ld", eventCode, (long)errorStatusCode];
+    } else if (itemError) {
+        failureCode = [NSString stringWithFormat:@"AVP_%@_%ld", eventCode, (long)errorCode];
+    }
+
+    appendPlaybackDiagnosticLine(line, failureCode, shouldShowBanner);
+}
+
+static void setupAVPlayerItemDiagnosticsObservers(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        playbackDiagObserverTokens = [NSMutableArray array];
+
+        id stalledToken = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemPlaybackStalledNotification
+                                                                             object:nil
+                                                                              queue:[NSOperationQueue mainQueue]
+                                                                         usingBlock:^(NSNotification *note) {
+            AVPlayerItem *item = [note.object isKindOfClass:[AVPlayerItem class]] ? (AVPlayerItem *)note.object : nil;
+            recordAVPlayerItemDiagnostic(@"STALLED", item, nil, YES);
+        }];
+        if (stalledToken) {
+            [playbackDiagObserverTokens addObject:stalledToken];
+        }
+
+        id failedToken = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemFailedToPlayToEndTimeNotification
+                                                                            object:nil
+                                                                             queue:[NSOperationQueue mainQueue]
+                                                                        usingBlock:^(NSNotification *note) {
+            AVPlayerItem *item = [note.object isKindOfClass:[AVPlayerItem class]] ? (AVPlayerItem *)note.object : nil;
+            NSError *error = note.userInfo[AVPlayerItemFailedToPlayToEndTimeErrorKey];
+            recordAVPlayerItemDiagnostic(@"FAILED_END", item, error, YES);
+        }];
+        if (failedToken) {
+            [playbackDiagObserverTokens addObject:failedToken];
+        }
+
+        id errorLogToken = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemNewErrorLogEntryNotification
+                                                                              object:nil
+                                                                               queue:[NSOperationQueue mainQueue]
+                                                                          usingBlock:^(NSNotification *note) {
+            AVPlayerItem *item = [note.object isKindOfClass:[AVPlayerItem class]] ? (AVPlayerItem *)note.object : nil;
+            recordAVPlayerItemDiagnostic(@"ERRLOG", item, nil, NO);
+        }];
+        if (errorLogToken) {
+            [playbackDiagObserverTokens addObject:errorLogToken];
+        }
+    });
 }
 
 static NSString *extractVisitorDataFromString(NSString *text) {
@@ -718,61 +788,6 @@ static void cacheVisitorData(NSString *value) {
     });
 }
 
-static NSString *currentVisitorData() {
-    __block NSString *value = nil;
-    dispatch_sync(visitorDataQueue(), ^{
-        if (!cachedVisitorData.length) {
-            cachedVisitorData = trimmedString([[NSUserDefaults standardUserDefaults] stringForKey:kCachedVisitorDataKey]);
-        }
-        value = cachedVisitorData;
-    });
-    return value;
-}
-
-static void bootstrapVisitorDataFromWebIfNeeded(void) {
-    if (visitorBootstrapRequested || currentVisitorData().length) {
-        return;
-    }
-
-    visitorBootstrapRequested = YES;
-    NSURL *url = [NSURL URLWithString:@"https://www.youtube.com"];
-    if (!url) {
-        return;
-    }
-
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:12.0];
-    [request setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1" forHTTPHeaderField:@"User-Agent"];
-    [request setValue:@"en-US,en;q=0.9" forHTTPHeaderField:@"Accept-Language"];
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error) {
-            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ VISITOR_BOOTSTRAP ERR", playbackDiagTimestamp()], @"VISITOR_BOOTSTRAP_ERR", NO);
-            return;
-        }
-
-        NSString *visitorDataFromHeaders = nil;
-        if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-            NSDictionary *headers = ((NSHTTPURLResponse *)response).allHeaderFields;
-            visitorDataFromHeaders = headerValueForKey(headers, @"X-Goog-Visitor-Id");
-            if (!visitorDataFromHeaders.length) {
-                visitorDataFromHeaders = headerValueForKey(headers, @"X-Youtube-Client-Visitor-Id");
-            }
-            if (!visitorDataFromHeaders.length) {
-                visitorDataFromHeaders = extractVisitorDataFromSetCookieHeader(headers);
-            }
-        }
-
-        NSString *resolvedVisitorData = visitorDataFromHeaders.length ? visitorDataFromHeaders : extractVisitorDataFromBody(data);
-        if (resolvedVisitorData.length) {
-            cacheVisitorData(resolvedVisitorData);
-            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ VISITOR_BOOTSTRAP OK source=%@", playbackDiagTimestamp(), visitorDataFromHeaders.length ? @"header" : @"body"], nil, NO);
-        } else {
-            appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ VISITOR_BOOTSTRAP EMPTY", playbackDiagTimestamp()], @"VISITOR_BOOTSTRAP_EMPTY", NO);
-        }
-    }];
-    [task resume];
-}
-
 static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request) {
     if (![request isKindOfClass:[NSURLRequest class]]) {
         return request;
@@ -780,77 +795,26 @@ static NSURLRequest *requestByInjectingVisitorDataIfNeeded(NSURLRequest *request
 
     NSURL *requestURL = request.URL;
     BOOL isInnerTube = isInnerTubeRequest(requestURL);
-    BOOL shouldNormalizePlaybackIdentity = shouldStripSignedInHeadersForURL(requestURL);
+    BOOL isTrackedGoogleVideo = isGoogleVideoPlaybackRequest(requestURL);
 
-    if (!isInnerTube && !shouldNormalizePlaybackIdentity) {
+    if (!isInnerTube && !isTrackedGoogleVideo) {
         return request;
     }
 
     NSDictionary *headers = request.allHTTPHeaderFields;
-    NSString *authorizationHeader = headerValueForKey(headers, @"Authorization");
     NSString *cookieHeader = headerValueForKey(headers, @"Cookie");
-    NSString *authUserHeader = headerValueForKey(headers, @"X-Goog-AuthUser");
-
-    BOOL hasSignedInCookie = headersContainSignedInCookie(cookieHeader);
-    BOOL shouldStripSignedInHeadersForPlayback = shouldNormalizePlaybackIdentity &&
-        (authorizationHeader.length > 0 || authUserHeader.length > 0 || hasSignedInCookie || headerLooksLoggedIn(headers));
-
-    NSString *visitorData = nil;
     NSString *visitorDataFromHeaders = headerValueForKey(headers, @"X-Goog-Visitor-Id");
     if (visitorDataFromHeaders.length) {
         cacheVisitorData(visitorDataFromHeaders);
-        visitorData = visitorDataFromHeaders;
     }
 
     NSString *visitorDataFromCookie = extractVisitorDataFromCookies(cookieHeader);
     if (visitorDataFromCookie.length) {
         cacheVisitorData(visitorDataFromCookie);
-        if (!visitorData.length) {
-            visitorData = visitorDataFromCookie;
-        }
     }
 
-    if (!visitorData.length) {
-        visitorData = currentVisitorData();
-    }
-
-    if (isInnerTube) {
-        if (!visitorData.length) {
-            visitorData = extractVisitorDataFromURL(requestURL);
-        }
-        if (!visitorData.length) {
-            visitorData = extractVisitorDataFromBody(request.HTTPBody);
-        }
-    }
-
-    BOOL shouldInjectVisitorHeader = isInnerTube && visitorData.length > 0;
-    if (isInnerTube && !shouldInjectVisitorHeader) {
-        bootstrapVisitorDataFromWebIfNeeded();
-    }
-
-    if (!shouldStripSignedInHeadersForPlayback && !shouldInjectVisitorHeader) {
-        recordPlaybackRequestDiagnostic(request, nil, NO, NO);
-        return request;
-    }
-
-    NSMutableURLRequest *mutableRequest = [request mutableCopy];
-    if (shouldInjectVisitorHeader) {
-        [mutableRequest setValue:visitorData forHTTPHeaderField:@"X-Goog-Visitor-Id"];
-    }
-
-    if (shouldStripSignedInHeadersForPlayback) {
-        [mutableRequest setValue:nil forHTTPHeaderField:@"Authorization"];
-        [mutableRequest setValue:nil forHTTPHeaderField:@"Cookie"];
-        [mutableRequest setValue:nil forHTTPHeaderField:@"X-Goog-AuthUser"];
-        [mutableRequest setValue:nil forHTTPHeaderField:@"X-Goog-PageId"];
-        [mutableRequest setValue:nil forHTTPHeaderField:@"X-Goog-Device-Auth"];
-        [mutableRequest setValue:@"0" forHTTPHeaderField:@"X-Goog-Logged-In"];
-        [mutableRequest setValue:@"0" forHTTPHeaderField:@"X-Youtube-Bootstrap-Logged-In"];
-    }
-
-    recordPlaybackRequestDiagnostic(request, mutableRequest, shouldStripSignedInHeadersForPlayback, shouldInjectVisitorHeader);
-
-    return mutableRequest;
+    recordPlaybackRequestDiagnostic(request, nil, NO, NO);
+    return request;
 }
 
 static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) {
@@ -878,13 +842,6 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
 %group gVisitorDataFix
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
-    NSURL *requestURL = self.URL;
-
-    if (shouldStripSignedInHeadersForURL(requestURL) && isBlockedSignedInHeaderField(field) && value.length) {
-        %orig(nil, field);
-        return;
-    }
-
     if ([field isKindOfClass:[NSString class]] && [field caseInsensitiveCompare:@"X-Goog-Visitor-Id"] == NSOrderedSame) {
         cacheVisitorData(value);
     }
@@ -892,28 +849,8 @@ static void cacheVisitorDataFromResponse(NSURLResponse *response, NSData *data) 
 }
 
 - (void)setAllHTTPHeaderFields:(NSDictionary<NSString *, NSString *> *)headerFields {
-    NSMutableDictionary<NSString *, NSString *> *normalizedHeaders = [headerFields isKindOfClass:[NSDictionary class]] ? [headerFields mutableCopy] : [NSMutableDictionary dictionary];
-
-    NSURL *requestURL = self.URL;
-    if (shouldStripSignedInHeadersForURL(requestURL)) {
-        NSArray<NSString *> *blockedFields = @[@"Authorization", @"Cookie", @"X-Goog-AuthUser", @"X-Goog-PageId", @"X-Goog-Device-Auth"];
-        for (NSString *blockedField in blockedFields) {
-            [normalizedHeaders removeObjectForKey:blockedField];
-            NSString *matchedHeader = nil;
-            for (NSString *existingKey in normalizedHeaders.allKeys) {
-                if ([existingKey caseInsensitiveCompare:blockedField] == NSOrderedSame) {
-                    matchedHeader = existingKey;
-                    break;
-                }
-            }
-            if (matchedHeader) {
-                [normalizedHeaders removeObjectForKey:matchedHeader];
-            }
-        }
-    }
-
-    cacheVisitorData(headerValueForKey(normalizedHeaders, @"X-Goog-Visitor-Id"));
-    %orig(normalizedHeaders);
+    cacheVisitorData(headerValueForKey(headerFields, @"X-Goog-Visitor-Id"));
+    %orig(headerFields);
 }
 %end
 
@@ -1405,12 +1342,14 @@ static void refreshUYouAppearance() {
     if (![defaults objectForKey:kPlaybackDiagnosticsAutoCopy]) {
         [defaults setBool:YES forKey:kPlaybackDiagnosticsAutoCopy];
     }
-    appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ APP_INIT stage=%ld", playbackDiagTimestamp(), (long)kPlaybackIsolationStage], nil, NO);
+
+    uYouEnhancedPlaybackDiagnosticsClear();
+    appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ APP_INIT stage=%ld mode=observer_only", playbackDiagTimestamp(), (long)kPlaybackIsolationStage], nil, NO);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1800 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         showPlaybackDiagnosticsBanner(@"Playback diagnostics active");
     });
+    setupAVPlayerItemDiagnosticsObservers();
 
-    bootstrapVisitorDataFromWebIfNeeded();
     %init(gGoogleSignInPatch);
     %init(gVisitorDataFix);
 
