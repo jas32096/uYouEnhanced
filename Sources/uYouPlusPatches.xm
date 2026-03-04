@@ -6,6 +6,7 @@
 #define YT_NAME @"YouTube"
 static NSInteger const kPlaybackIsolationStage = 1;
 static BOOL const kEnableGoogleSignInBundlePatch = NO;
+static BOOL const kEnablePlaybackDiagnosticsHooks = NO;
 
 # pragma mark - YouTube patches
 
@@ -93,6 +94,7 @@ static NSString *queryKeySummaryForURL(NSURL *url, NSUInteger maxKeys);
 static NSString *playbackURLFingerprint(NSURL *url);
 static void logRuntimePlayerClassDiagnostics(void);
 static void enforcePlaybackIsolationDefaults(void);
+static void applyPlaybackCompatibilityRuntimePatches(void);
 
 static dispatch_queue_t visitorDataQueue() {
     static dispatch_queue_t queue;
@@ -609,6 +611,129 @@ static void enforcePlaybackIsolationDefaults(void) {
                                   (unsigned long)changedCount],
                               nil,
                               NO);
+}
+
+static BOOL playbackCompatibilityReturnNO(id self, SEL _cmd) {
+    return NO;
+}
+
+static BOOL shouldPatchPlaybackCompatibilitySelector(NSString *selectorName) {
+    NSString *lowercaseSelector = trimmedString(selectorName).lowercaseString;
+    if (!lowercaseSelector.length) {
+        return NO;
+    }
+
+    NSArray<NSString *> *tokens = @[
+        @"ump",
+        @"unifiedmedia",
+        @"unified_media",
+        @"mediapipeline",
+        @"media_pipeline",
+        @"attestation",
+        @"integrity",
+        @"proof",
+        @"pot",
+        @"playbacktoken"
+    ];
+
+    for (NSString *token in tokens) {
+        if ([lowercaseSelector containsString:token]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL methodReturnsBoolean(Method method) {
+    char returnType[8] = {0};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    return returnType[0] == 'B' || returnType[0] == 'c';
+}
+
+static NSUInteger patchPlaybackCompatibilityMethodsOnClass(Class cls, NSString *className) {
+    if (!cls) {
+        return 0;
+    }
+
+    unsigned int methodCount = 0;
+    Method *methods = class_copyMethodList(cls, &methodCount);
+    if (!methods || methodCount == 0) {
+        if (methods) {
+            free(methods);
+        }
+        return 0;
+    }
+
+    NSUInteger patchedCount = 0;
+    NSMutableArray<NSString *> *sampleSelectors = [NSMutableArray array];
+
+    for (unsigned int idx = 0; idx < methodCount; idx++) {
+        Method method = methods[idx];
+        if (!method || method_getNumberOfArguments(method) != 2 || !methodReturnsBoolean(method)) {
+            continue;
+        }
+
+        SEL selector = method_getName(method);
+        NSString *selectorName = NSStringFromSelector(selector);
+        if (!shouldPatchPlaybackCompatibilitySelector(selectorName)) {
+            continue;
+        }
+
+        if (method_getImplementation(method) == (IMP)playbackCompatibilityReturnNO) {
+            continue;
+        }
+
+        method_setImplementation(method, (IMP)playbackCompatibilityReturnNO);
+        patchedCount++;
+
+        if (sampleSelectors.count < 6) {
+            [sampleSelectors addObject:selectorName];
+        }
+    }
+
+    free(methods);
+
+    if (patchedCount > 0) {
+        NSString *sample = sampleSelectors.count ? [sampleSelectors componentsJoinedByString:@","] : @"-";
+        appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ COMPAT_PATCH class=%@ patched=%lu sample=%@",
+                                      playbackDiagTimestamp(),
+                                      className ?: @"-",
+                                      (unsigned long)patchedCount,
+                                      shortenedDiagnosticString(sample, 90)],
+                                  nil,
+                                  NO);
+    }
+
+    return patchedCount;
+}
+
+static void applyPlaybackCompatibilityRuntimePatches(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSArray<NSString *> *classNames = @[@"YTHotConfig", @"YTColdConfig"];
+        NSUInteger totalPatched = 0;
+
+        for (NSString *className in classNames) {
+            Class cls = NSClassFromString(className);
+            if (!cls) {
+                appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ COMPAT_PATCH class=%@ missing=1",
+                                              playbackDiagTimestamp(),
+                                              className],
+                                          nil,
+                                          NO);
+                continue;
+            }
+
+            totalPatched += patchPlaybackCompatibilityMethodsOnClass(cls, className);
+            totalPatched += patchPlaybackCompatibilityMethodsOnClass(object_getClass(cls), [className stringByAppendingString:@"_META"]);
+        }
+
+        appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ COMPAT_PATCH total=%lu",
+                                      playbackDiagTimestamp(),
+                                      (unsigned long)totalPatched],
+                                  nil,
+                                  NO);
+    });
 }
 
 static BOOL headerLooksLoggedIn(NSDictionary *headers) {
@@ -1347,6 +1472,25 @@ static void retainWrappedSessionDelegateProxy(NSURLSession *session, id original
     }
 }
 
+%group gPlaybackCompatibilityFix
+%hook YTIPlayerResponse
+- (BOOL)isMonetized {
+    return NO;
+}
+
+%new(@@:)
+- (NSMutableArray *)playerAdsArray {
+    return [NSMutableArray array];
+}
+%end
+
+%hook YTLocalPlaybackController
+- (id)createAdsPlaybackCoordinator {
+    return nil;
+}
+%end
+%end
+
 %group gVisitorDataFix
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
@@ -1901,15 +2045,22 @@ static void refreshUYouAppearance() {
     }
 
     uYouEnhancedPlaybackDiagnosticsClear();
-    appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ APP_INIT stage=%ld mode=observer_only", playbackDiagTimestamp(), (long)kPlaybackIsolationStage], nil, NO);
+    appendPlaybackDiagnosticLine([NSString stringWithFormat:@"%@ APP_INIT stage=%ld mode=compat_hotfix", playbackDiagTimestamp(), (long)kPlaybackIsolationStage], nil, NO);
     enforcePlaybackIsolationDefaults();
+    applyPlaybackCompatibilityRuntimePatches();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1800 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         showPlaybackDiagnosticsBanner(@"Playback diagnostics active");
     });
-    setupAVPlayerItemDiagnosticsObservers();
+
+    if (kEnablePlaybackDiagnosticsHooks) {
+        setupAVPlayerItemDiagnosticsObservers();
+    }
 
     %init(gGoogleSignInPatch);
-    %init(gVisitorDataFix);
+    if (kEnablePlaybackDiagnosticsHooks) {
+        %init(gVisitorDataFix);
+    }
+    %init(gPlaybackCompatibilityFix);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1200 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         logRuntimePlayerClassDiagnostics();
